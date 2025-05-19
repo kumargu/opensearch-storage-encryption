@@ -29,12 +29,14 @@ import org.opensearch.crypto.CryptoHandlerRegistry;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
+import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
 import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
+import org.opensearch.index.store.mmap.CryptoMMapDirectory;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 import org.opensearch.plugins.IndexStorePlugin;
 
-@SuppressForbidden(reason = "temprary")
+@SuppressForbidden(reason = "temporary")
 /**
  * Factory for an encrypted filesystem directory
  */
@@ -116,26 +118,24 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         // [cfe, tvd, fnm, nvm, write.lock, dii, pay, segments_N, pos, si, fdt, tvx, liv, dvm, fdx, vem]
         Set<String> nioExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_HYBRID_NIO_EXTENSIONS));
 
-        return new CryptoNIOFSDirectory(lockFactory, location, provider, keyIvResolver);
-
-        // switch (type) {
-        // case HYBRIDFS -> {
-        // LOGGER.debug("Using HYBRIDFS directory");
-        // CryptoMMapDirectory mmapDir = new CryptoMMapDirectory(location, provider, keyIvResolver);
-        // mmapDir.setPreloadExtensions(preLoadExtensions);
-        // return new HybridCryptoDirectory(lockFactory, mmapDir, provider, keyIvResolver, nioExtensions);
-        // }
-        // case MMAPFS -> {
-        // LOGGER.debug("Using MMAPFS directory");
-        // CryptoMMapDirectory cryptoMMapDir = new CryptoMMapDirectory(location, provider, keyIvResolver);
-        // cryptoMMapDir.setPreloadExtensions(preLoadExtensions);
-        // return cryptoMMapDir;
-        // }
-        // case SIMPLEFS, NIOFS -> {
-        // LOGGER.debug("Using NIOFS directory");
-        // return new CryptoNIOFSDirectory(lockFactory, location, provider, keyIvResolver);
-        // }
-        // default -> throw new AssertionError("unexpected built-in store type [" + type + "]");
-        // }
+        switch (type) {
+            case HYBRIDFS -> {
+                LOGGER.debug("Using HYBRIDFS directory");
+                CryptoMMapDirectory mmapDir = new CryptoMMapDirectory(location, provider, keyIvResolver);
+                mmapDir.setPreloadExtensions(preLoadExtensions);
+                return new HybridCryptoDirectory(lockFactory, mmapDir, provider, keyIvResolver, nioExtensions);
+            }
+            case MMAPFS -> {
+                LOGGER.debug("Using MMAPFS directory");
+                CryptoMMapDirectory cryptoMMapDir = new CryptoMMapDirectory(location, provider, keyIvResolver);
+                cryptoMMapDir.setPreloadExtensions(preLoadExtensions);
+                return cryptoMMapDir;
+            }
+            case SIMPLEFS, NIOFS -> {
+                LOGGER.debug("Using NIOFS directory");
+                return new CryptoNIOFSDirectory(lockFactory, location, provider, keyIvResolver);
+            }
+            default -> throw new AssertionError("unexpected built-in store type [" + type + "]");
+        }
     }
 }

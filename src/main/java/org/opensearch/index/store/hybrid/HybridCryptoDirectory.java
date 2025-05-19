@@ -32,7 +32,37 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
         throws IOException {
         super(lockFactory, delegate.getDirectory(), provider, keyIvResolver);
         this.delegate = delegate;
-        this.nioExtensions = nioExtensions;
+        this.nioExtensions = Set
+            .of(
+                "cfe",
+                "tvd",
+                "fnm",
+                "nvm",
+                "write.lock",
+                "dii",
+                "pay",
+                "segments_N",
+                "pos",
+                "si",
+                "fdt",
+                "tvx",
+                "liv",
+                "dvm",
+                "fdx",
+                "vem",
+                "fdm",
+                "kdm",
+                "kdi",
+                "psm",
+                "tmd",
+                "tip",
+                "nvd"
+                // "cfs"
+                // "tim"
+                // "doc",
+                // "dvd",
+                // "kdd"
+            );
     }
 
     @Override
@@ -54,8 +84,8 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
         }
 
         // [cfe, tvd, fnm, nvm, write.lock, dii, pay, segments_N, pos, si, fdt, tvx, liv, dvm, fdx, vem]
-
-        return extension == null || !nioExtensions.contains(extension);
+        boolean result = extension == null || !nioExtensions.contains(extension);
+        return result;
     }
 
     @Override
