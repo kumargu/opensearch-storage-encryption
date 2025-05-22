@@ -306,56 +306,6 @@ public final class OpenSslPanamaCipher {
         }
     }
 
-    // public static void decryptInPlace(long addr, long length, byte[] key, byte[] iv, long fileOffset) throws Throwable {
-    // if (key == null || key.length != AES_256_KEY_SIZE)
-    // throw new IllegalArgumentException("Key must be 32 bytes for AES-256-CTR");
-    // if (iv == null || iv.length != AES_BLOCK_SIZE)
-    // throw new IllegalArgumentException("IV must be 16 bytes for AES-CTR");
-
-    // try (Arena arena = Arena.ofConfined()) {
-    // // Create context
-    // MemorySegment ctx = (MemorySegment) EVP_CIPHER_CTX_new.invoke();
-    // if (ctx.address() == 0)
-    // throw new OpenSslException("EVP_CIPHER_CTX_new failed");
-
-    // try {
-    // // Get cipher type
-    // MemorySegment cipher = (MemorySegment) EVP_aes_256_ctr.invoke();
-    // if (cipher.address() == 0)
-    // throw new OpenSslException("EVP_aes_256_ctr failed");
-
-    // // Adjust IV for file offset
-    // byte[] adjustedIV = computeOffsetIV(iv, fileOffset);
-    // MemorySegment keySeg = arena.allocateArray(ValueLayout.JAVA_BYTE, key);
-    // MemorySegment ivSeg = arena.allocateArray(ValueLayout.JAVA_BYTE, adjustedIV);
-
-    // // Init cipher
-    // int rc = (int) EVP_EncryptInit_ex.invoke(ctx, cipher, MemorySegment.NULL, keySeg, ivSeg);
-    // if (rc != 1)
-    // throw new OpenSslException("EVP_EncryptInit_ex failed");
-
-    // // Skip bytes inside first block, if fileOffset is not block-aligned
-    // int partialBlockOffset = (int) (fileOffset % AES_BLOCK_SIZE);
-    // if (partialBlockOffset > 0) {
-    // MemorySegment dummyIn = arena.allocateArray(ValueLayout.JAVA_BYTE, partialBlockOffset);
-    // MemorySegment dummyOut = arena.allocate(partialBlockOffset + AES_BLOCK_SIZE);
-    // MemorySegment dummyLen = arena.allocate(ValueLayout.JAVA_INT);
-    // EVP_EncryptUpdate.invoke(ctx, dummyOut, dummyLen, dummyIn, partialBlockOffset);
-    // }
-
-    // // Main in-place decryption: addr -> addr
-    // MemorySegment inOut = MemorySegment.ofAddress(addr).reinterpret(length);
-    // MemorySegment outLen = arena.allocate(ValueLayout.JAVA_INT);
-    // rc = (int) EVP_EncryptUpdate.invoke(ctx, inOut, outLen, inOut, (int) length);
-    // if (rc != 1)
-    // throw new OpenSslException("EVP_EncryptUpdate failed");
-
-    // } finally {
-    // EVP_CIPHER_CTX_free.invoke(ctx);
-    // }
-    // }
-    // }
-
     public static void decryptInPlace(long addr, long length, byte[] key, byte[] iv, long fileOffset) throws Throwable {
         if (key == null || key.length != AES_256_KEY_SIZE)
             throw new IllegalArgumentException("Key must be 32 bytes for AES-256-CTR");
@@ -397,37 +347,38 @@ public final class OpenSslPanamaCipher {
                     MemorySegment dummyLen = arena.allocate(ValueLayout.JAVA_INT);
                     EVP_EncryptUpdate.invoke(ctx, dummyOut, dummyLen, dummyIn, partialBlockOffset);
                     long tDummyEnd = System.nanoTime();
-                    System.out.printf("  > Dummy block skip: %,d µs%n", (tDummyEnd - tDummyStart) / 1_000);
                 }
 
-                long tUpdateStart = System.nanoTime();
                 MemorySegment inOut = MemorySegment.ofAddress(addr).reinterpret(length);
                 MemorySegment outLen = arena.allocate(ValueLayout.JAVA_INT);
+
+                long tUpdateStart = System.nanoTime();
                 rc = (int) EVP_EncryptUpdate.invoke(ctx, inOut, outLen, inOut, (int) length);
                 long tUpdateEnd = System.nanoTime();
+
                 if (rc != 1)
                     throw new OpenSslException("EVP_EncryptUpdate failed");
 
                 // Final log
                 long tEnd = System.nanoTime();
-                LOGGER
-                    .info(
-                        "Decryption breakdown ({} MiB at offset {}):\n"
-                            + "  > ctx alloc:        {} µs\n"
-                            + "  > cipher lookup:    {} µs\n"
-                            + "  > key/iv alloc:     {} µs\n"
-                            + "  > init cipher:      {} µs\n"
-                            + "  > update decrypt:   {} µs\n"
-                            + "  > total time:       {} µs",
-                        String.format("%.2f", length / 1048576.0),
-                        fileOffset,
-                        (tCtxAlloc - tCtxStart) / 1_000,
-                        (tCipherLookup - tCipherStart) / 1_000,
-                        (tKeyIvAlloc - tKeyIvStart) / 1_000,
-                        (tInit - tKeyIvAlloc) / 1_000,
-                        (tUpdateEnd - tUpdateStart) / 1_000,
-                        (tEnd - tStart) / 1_000
-                    );
+                // LOGGER
+                // .info(
+                // "Decryption breakdown ({} MiB at offset {}):\n"
+                // + " > ctx alloc: {} µs\n"
+                // + " > cipher lookup: {} µs\n"
+                // + " > key/iv alloc: {} µs\n"
+                // + " > init cipher: {} µs\n"
+                // + " > update decrypt: {} µs\n"
+                // + " > total time: {} µs",
+                // String.format("%.2f", length / 1048576.0),
+                // fileOffset,
+                // (tCtxAlloc - tCtxStart) / 1_000,
+                // (tCipherLookup - tCipherStart) / 1_000,
+                // (tKeyIvAlloc - tKeyIvStart) / 1_000,
+                // (tInit - tKeyIvAlloc) / 1_000,
+                // (tUpdateEnd - tUpdateStart) / 1_000,
+                // (tEnd - tStart) / 1_000
+                // );
 
             } finally {
                 EVP_CIPHER_CTX_free.invoke(ctx);

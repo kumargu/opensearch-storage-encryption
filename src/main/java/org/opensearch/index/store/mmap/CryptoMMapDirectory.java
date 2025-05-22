@@ -24,7 +24,6 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
-import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.Provider;
@@ -40,13 +39,11 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.index.store.cipher.OpenSslPanamaCipher;
-import org.opensearch.index.store.cipher.OpenSslPanamaCipher.OpenSslException;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 @SuppressWarnings("preview")
 @SuppressForbidden(reason = "temporary bypass")
 public final class CryptoMMapDirectory extends MMapDirectory {
-
     private static final Logger LOGGER = LogManager.getLogger(CryptoMMapDirectory.class);
 
     private final KeyIvResolver keyIvResolver;
@@ -207,105 +204,12 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         return segments;
     }
 
-    private void decryptSegment(MemorySegment segment, long offset) throws Exception {
-        final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
-        final byte[] iv = this.keyIvResolver.getIvBytes();
-
-        ByteBuffer buffer = segment.asByteBuffer();
-        final int CHUNK_SIZE = 8192;
-        byte[] encrypted = new byte[CHUNK_SIZE];
-
-        int position = 0;
-        long startTime = System.nanoTime();
-
-        while (position < buffer.capacity()) {
-            int size = Math.min(CHUNK_SIZE, buffer.capacity() - position);
-            buffer.position(position);
-            buffer.get(encrypted, 0, size);
-
-            try {
-                byte[] decrypted = OpenSslPanamaCipher.decrypt(key, iv, encrypted, offset + position);
-
-                buffer.position(position);
-                buffer.put(decrypted, 0, size);
-                position += size;
-            } catch (Throwable ex) {
-                throw new OpenSslException("EVP_CIPHER_CTX_update failed");
-            }
-        }
-
-        long endTime = System.nanoTime();
-        long elapsedMs = (endTime - startTime) / 1_000_000;
-
-        LOGGER.info("Finished decryption of segment size {} time taken = {} ms", segment.byteSize() / 1_048_576.0, elapsedMs);
-    }
-
-    // public void decryptSegmentInPlaceParallel(MemorySegment segment, long segmentOffsetInFile) throws Throwable {
-    // final long size = segment.byteSize();
-
-    // final int oneMB = 1 << 20;
-    // final int twoMB = 1 << 21;
-    // final int fourMB = 1 << 22;
-
-    // final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
-    // final byte[] iv = this.keyIvResolver.getIvBytes();
-
-    // if (size <= oneMB) {
-    // long startTimeOneMb = System.nanoTime();
-    // // Fast serial path for very small segments
-    // OpenSslPanamaCipher.decryptInPlace(segment.address(), size, key, iv, segmentOffsetInFile);
-    // long endTimeOneMB = System.nanoTime();
-    // long elapsedMsOneMB = (endTimeOneMB - startTimeOneMb) / 1_000_000;
-
-    // // LOGGER
-    // // .info(
-    // // "Finished fast-path decryption of segment size {} at offset {}: time taken = {} ms",
-    // // size / 1_048_576.0,
-    // // segmentOffsetInFile,
-    // // elapsedMsOneMB
-    // // );
-    // return;
-    // }
-
-    // // Decide chunk size based on segment size
-    // final int chunkSize = size <= fourMB ? oneMB : twoMB;
-    // final int numChunks = (int) ((size + chunkSize - 1) / chunkSize);
-
-    // long startTime = System.nanoTime();
-
-    // IntStream.range(0, numChunks).parallel().forEach(i -> {
-    // long offset = (long) i * chunkSize;
-    // long length = Math.min(chunkSize, size - offset);
-    // long fileOffset = segmentOffsetInFile + offset;
-    // long addr = segment.address() + offset;
-
-    // try {
-    // OpenSslPanamaCipher.decryptInPlace(addr, length, key, iv, fileOffset);
-    // } catch (Throwable t) {
-    // throw new RuntimeException("Decryption failed at offset: " + fileOffset, t);
-    // }
-    // });
-
-    // long endTime = System.nanoTime();
-    // long elapsedMs = (endTime - startTime) / 1_000_000;
-    // double sizeInMb = size / 1_048_576.0;
-
-    // // LOGGER
-    // // .info(
-    // // "Finished decryption of {} chunks of segment size {} at offset {}: time taken = {} ms",
-    // // numChunks,
-    // // sizeInMb,
-    // // segmentOffsetInFile,
-    // // elapsedMs
-    // // );
-    // }
-
     public void decryptSegmentInPlaceParallel(MemorySegment segment, long segmentOffsetInFile) throws Throwable {
         final long size = segment.byteSize();
 
-        final int oneMB = 1 << 20;   // 1 MiB
-        final int twoMB = 1 << 21;   // 2 MiB
-        final int fourMB = 1 << 22;  // 4 MiB
+        final int oneMB = 1 << 20; // 1 MiB
+        final int twoMB = 1 << 21; // 2 MiB
+        final int fourMB = 1 << 22; // 4 MiB
         final int eightMB = 1 << 23; // 8 MiB
         final int sixteenMB = 1 << 24; // 16 MiB
 
@@ -313,26 +217,25 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         final byte[] iv = this.keyIvResolver.getIvBytes();
 
         // Fast-path: no parallelism for ≤ 2 MiB
-        if (size <= (2L << 20)) {
+        if (size <= (4L << 20)) {
             long start = System.nanoTime();
             OpenSslPanamaCipher.decryptInPlace(segment.address(), size, key, iv, segmentOffsetInFile);
             long end = System.nanoTime();
             long durationMs = (end - start) / 1_000_000;
-
             // Optional logging
-            // LOGGER.info("Fast-path decryption of {:.2f} MiB at offset {} took {} ms",
-            // size / 1048576.0, segmentOffsetInFile, durationMs);
+            LOGGER.info("Fast-path decryption of {} MiB at offset {} took {} ms", size / 1048576.0, segmentOffsetInFile, durationMs);
+
             return;
         }
 
         // Choose adaptive chunk size
         final int chunkSize;
-        if (size <= (4L << 20)) {
-            chunkSize = oneMB;
-        } else if (size <= (16L << 20)) {
-            chunkSize = twoMB;
-        } else if (size <= (32L << 20)) {
+        if (size <= (8L << 20)) {
             chunkSize = fourMB;
+        } else if (size <= (16L << 20)) {
+            chunkSize = fourMB;
+        } else if (size <= (32L << 20)) {
+            chunkSize = eightMB;
         } else if (size <= (64L << 20)) {
             chunkSize = eightMB;
         } else {
@@ -359,8 +262,14 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         long elapsedMs = (endTime - startTime) / 1_000_000;
 
         // Optional logging
-        // LOGGER.info("Parallel decryption of {} chunks ({} MiB total) at offset {} took {} ms",
-        // numChunks, String.format("%.2f", size / 1048576.0), segmentOffsetInFile, elapsedMs);
+        LOGGER
+            .info(
+                "Parallel decryption of {} chunks ({} MiB total) at offset {} took {} ms",
+                numChunks,
+                String.format("%.2f", size / 1048576.0),
+                segmentOffsetInFile,
+                elapsedMs
+            );
     }
 
     private static final MethodHandle OPEN;
