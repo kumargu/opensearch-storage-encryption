@@ -17,6 +17,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.LockFactory;
+import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.SuppressForbidden;
@@ -121,9 +122,13 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         switch (type) {
             case HYBRIDFS -> {
                 LOGGER.debug("Using HYBRIDFS directory");
-                CryptoMMapDirectory mmapDir = new CryptoMMapDirectory(location, provider, keyIvResolver);
-                mmapDir.setPreloadExtensions(preLoadExtensions);
-                return new HybridCryptoDirectory(lockFactory, mmapDir, provider, keyIvResolver, nioExtensions);
+                CryptoMMapDirectory cryptoMMapDirectory = new CryptoMMapDirectory(location, provider, keyIvResolver);
+
+                MMapDirectory mapDirectory = new MMapDirectory(location, lockFactory);
+
+                cryptoMMapDirectory.setPreloadExtensions(preLoadExtensions);
+
+                return new HybridCryptoDirectory(lockFactory, cryptoMMapDirectory, mapDirectory, provider, keyIvResolver, nioExtensions);
             }
             case MMAPFS -> {
                 LOGGER.debug("Using MMAPFS directory");

@@ -32,7 +32,7 @@ import org.opensearch.index.store.iv.KeyIvResolver;
  */
 public class CryptoNIOFSDirectory extends NIOFSDirectory {
     private final Provider provider;
-    private final KeyIvResolver keyIvResolver;
+    public final KeyIvResolver keyIvResolver;
     private final AtomicLong nextTempFileCounter = new AtomicLong();
 
     public CryptoNIOFSDirectory(LockFactory lockFactory, Path location, Provider provider, KeyIvResolver keyIvResolver) throws IOException {

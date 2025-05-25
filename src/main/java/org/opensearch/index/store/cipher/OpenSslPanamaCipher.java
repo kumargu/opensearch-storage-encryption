@@ -4,6 +4,7 @@
  */
 package org.opensearch.index.store.cipher;
 
+import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -232,6 +233,88 @@ public final class OpenSslPanamaCipher {
             } finally {
                 EVP_CIPHER_CTX_free.invoke(ctx);
             }
+        }
+    }
+
+    public static void decryptInto(MemorySegment segment, long segmentOffset, int length, byte[] key, byte[] iv, byte[] outBuf, int outOff)
+        throws IOException {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment in = arena.allocateArray(ValueLayout.JAVA_BYTE, length);
+            for (int i = 0; i < length; i++) {
+                in.setAtIndex(ValueLayout.JAVA_BYTE, i, segment.get(ValueLayout.JAVA_BYTE, segmentOffset + i));
+            }
+
+            byte[] adjustedIv = computeOffsetIV(iv, segmentOffset);
+            MemorySegment ctx = (MemorySegment) EVP_CIPHER_CTX_new.invoke();
+            if (ctx.address() == 0)
+                throw new OpenSslException("ctx creation failed");
+
+            try {
+                MemorySegment cipher = (MemorySegment) EVP_aes_256_ctr.invoke();
+                if (cipher.address() == 0)
+                    throw new OpenSslException("cipher fetch failed");
+
+                MemorySegment keySeg = arena.allocateArray(ValueLayout.JAVA_BYTE, key);
+                MemorySegment ivSeg = arena.allocateArray(ValueLayout.JAVA_BYTE, adjustedIv);
+                MemorySegment out = arena.allocateArray(ValueLayout.JAVA_BYTE, length);
+                MemorySegment outLen = arena.allocate(ValueLayout.JAVA_INT);
+
+                int rc = (int) EVP_EncryptInit_ex.invoke(ctx, cipher, MemorySegment.NULL, keySeg, ivSeg);
+                if (rc != 1)
+                    throw new OpenSslException("EncryptInit failed");
+
+                rc = (int) EVP_EncryptUpdate.invoke(ctx, out, outLen, in, length);
+                if (rc != 1)
+                    throw new OpenSslException("EncryptUpdate failed");
+
+                for (int i = 0; i < length; i++) {
+                    outBuf[outOff + i] = out.get(ValueLayout.JAVA_BYTE, i);
+                }
+            } finally {
+                EVP_CIPHER_CTX_free.invoke(ctx);
+            }
+        } catch (Throwable t) {
+            throw new IOException("Failed to decrypt block at offset " + segmentOffset + " with length " + length, t);
+        }
+    }
+
+    public static byte decryptByte(MemorySegment segment, byte[] key, byte[] iv, long absoluteOffset) throws IOException {
+        byte[] input = new byte[1];
+        input[0] = segment.get(ValueLayout.JAVA_BYTE, absoluteOffset);
+
+        byte[] output = new byte[1];
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment in = arena.allocateArray(ValueLayout.JAVA_BYTE, input);
+            MemorySegment out = arena.allocateArray(ValueLayout.JAVA_BYTE, output);
+            MemorySegment outLen = arena.allocate(ValueLayout.JAVA_INT);
+
+            byte[] adjustedIv = computeOffsetIV(iv, absoluteOffset);
+            MemorySegment ctx = (MemorySegment) EVP_CIPHER_CTX_new.invoke();
+            if (ctx.address() == 0)
+                throw new OpenSslException("ctx creation failed");
+
+            try {
+                MemorySegment cipher = (MemorySegment) EVP_aes_256_ctr.invoke();
+                if (cipher.address() == 0)
+                    throw new OpenSslException("cipher fetch failed");
+
+                MemorySegment keySeg = arena.allocateArray(ValueLayout.JAVA_BYTE, key);
+                MemorySegment ivSeg = arena.allocateArray(ValueLayout.JAVA_BYTE, adjustedIv);
+
+                int rc = (int) EVP_EncryptInit_ex.invoke(ctx, cipher, MemorySegment.NULL, keySeg, ivSeg);
+                if (rc != 1)
+                    throw new OpenSslException("EncryptInit failed");
+
+                rc = (int) EVP_EncryptUpdate.invoke(ctx, out, outLen, in, 1);
+                if (rc != 1)
+                    throw new OpenSslException("EncryptUpdate failed");
+
+                return out.get(ValueLayout.JAVA_BYTE, 0);
+            } finally {
+                EVP_CIPHER_CTX_free.invoke(ctx);
+            }
+        } catch (Throwable t) {
+            throw new IOException("Failed to decrypt single byte at offset " + absoluteOffset, t);
         }
     }
 
