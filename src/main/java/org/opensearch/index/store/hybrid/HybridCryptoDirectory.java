@@ -12,24 +12,24 @@ import org.apache.lucene.store.FileSwitchDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.LockFactory;
-import org.apache.lucene.store.MMapDirectory;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.store.mmap.CryptoMMapDirectory;
-import org.opensearch.index.store.mmap.MMapCryptoIndexInput;
+import org.opensearch.index.store.mmap.CryptoMMapDirectoryLargeFiles;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 
 public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
 
     private final CryptoMMapDirectory delegate;
-    private final MMapDirectory mmapDirectoryDelegate;
+    private final CryptoMMapDirectoryLargeFiles cryptoMMapDirectoryLargeFilesDelegate;
     private final Set<String> nioExtensions;
-    private Set<String> mmapDirectoryExtensions;
+    private final Set<String> largeFileExtensions;
+    private final Set<String> smallFileExtensions;
 
     public HybridCryptoDirectory(
         LockFactory lockFactory,
         CryptoMMapDirectory delegate,
-        MMapDirectory mmapDirectoryDelegate,
+        CryptoMMapDirectoryLargeFiles cryptoMMapDirectoryLargeFilesDelegate,
         Provider provider,
         KeyIvResolver keyIvResolver,
         Set<String> nioExtensions
@@ -37,7 +37,7 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
         throws IOException {
         super(lockFactory, delegate.getDirectory(), provider, keyIvResolver);
         this.delegate = delegate;
-        this.mmapDirectoryDelegate = mmapDirectoryDelegate;
+        this.cryptoMMapDirectoryLargeFilesDelegate = cryptoMMapDirectoryLargeFilesDelegate;
         this.nioExtensions = Set
             .of(
                 "cfe",
@@ -62,11 +62,10 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
                 "psm",
                 "tmd",
                 "tip",
-                "nvd",
-                "cfs",
-                "tim"
+                "nvd"
             );
-        this.mmapDirectoryExtensions = Set.of("doc", "dvd", "kdd");
+        this.smallFileExtensions = Set.of("tim", "doc", "dvd", "kdd");
+        this.largeFileExtensions = Set.of("cfs");
     }
 
     @Override
@@ -75,15 +74,10 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
         ensureCanRead(name);
 
         String extension = FileSwitchDirectory.getExtension(name);
-        if (extension != null && mmapDirectoryExtensions.contains(extension)) {
-            // Route to MMapCryptoIndexInput directly
-            return new MMapCryptoIndexInput(
-                "MMapCryptoIndexInput(path=\"" + name + "\")",
-                mmapDirectoryDelegate.openInput(name, context),
-                keyIvResolver
-            );
-        } else if (useDelegate(name)) {
-            // Route to CryptoMMapDirectory (decrypt + mmap)
+
+        if (extension != null && largeFileExtensions.contains(extension)) {
+            return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+        } else if (extension != null && smallFileExtensions.contains(extension)) {
             return delegate.openInput(name, context);
         } else {
             // Default to CryptoNIOFSDirectory

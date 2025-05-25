@@ -164,6 +164,44 @@ public final class OpenSslPanamaCipher {
         return ivCopy;
     }
 
+    public static MemorySegment decryptInto(long srcAddr, long length, byte[] key, byte[] iv, long fileOffset, Arena arena)
+        throws Throwable {
+        if (key == null || key.length != AES_256_KEY_SIZE)
+            throw new IllegalArgumentException("Key must be 32 bytes for AES-256-CTR");
+        if (iv == null || iv.length != AES_BLOCK_SIZE)
+            throw new IllegalArgumentException("IV must be 16 bytes for AES-CTR");
+
+        MemorySegment ctx = (MemorySegment) EVP_CIPHER_CTX_new.invoke();
+        if (ctx.address() == 0)
+            throw new OpenSslException("EVP_CIPHER_CTX_new failed");
+
+        try {
+            MemorySegment cipher = (MemorySegment) EVP_aes_256_ctr.invoke();
+            if (cipher.address() == 0)
+                throw new OpenSslException("EVP_aes_256_ctr failed");
+
+            byte[] adjustedIV = computeOffsetIV(iv, fileOffset);
+            MemorySegment keySeg = arena.allocateArray(ValueLayout.JAVA_BYTE, key);
+            MemorySegment ivSeg = arena.allocateArray(ValueLayout.JAVA_BYTE, adjustedIV);
+
+            int rc = (int) EVP_EncryptInit_ex.invoke(ctx, cipher, MemorySegment.NULL, keySeg, ivSeg);
+            if (rc != 1)
+                throw new OpenSslException("EVP_EncryptInit_ex failed");
+
+            MemorySegment src = MemorySegment.ofAddress(srcAddr).reinterpret(length);
+            MemorySegment dst = arena.allocateArray(ValueLayout.JAVA_BYTE, (int) length);
+            MemorySegment outLen = arena.allocate(ValueLayout.JAVA_INT);
+
+            rc = (int) EVP_EncryptUpdate.invoke(ctx, dst, outLen, src, (int) length);
+            if (rc != 1)
+                throw new OpenSslException("EVP_EncryptUpdate failed");
+
+            return dst;
+        } finally {
+            EVP_CIPHER_CTX_free.invoke(ctx);
+        }
+    }
+
     /**
      * Encrypts the input data using AES-256-CTR mode.
      *

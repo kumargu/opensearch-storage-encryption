@@ -43,7 +43,7 @@ import org.opensearch.index.store.iv.KeyIvResolver;
 
 @SuppressWarnings("preview")
 @SuppressForbidden(reason = "temporary bypass")
-public final class CryptoMMapDirectory extends MMapDirectory {
+public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
     private static final Logger LOGGER = LogManager.getLogger(CryptoMMapDirectory.class);
 
     private final KeyIvResolver keyIvResolver;
@@ -53,7 +53,6 @@ public final class CryptoMMapDirectory extends MMapDirectory {
     private static final int PROT_WRITE = 0x2;
     private static final int MAP_PRIVATE = 0x02;
     private static final MethodHandle MMAP;
-
     private static final SymbolLookup LIBC = loadLibc();
 
     private static SymbolLookup loadLibc() {
@@ -109,7 +108,7 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         }
     }
 
-    public CryptoMMapDirectory(Path path, Provider provider, KeyIvResolver keyIvResolver) throws IOException {
+    public CryptoMMapDirectoryLargeFiles(Path path, Provider provider, KeyIvResolver keyIvResolver) throws IOException {
         super(path);
         this.keyIvResolver = keyIvResolver;
     }
@@ -148,7 +147,6 @@ public final class CryptoMMapDirectory extends MMapDirectory {
 
         Path file = getDirectory().resolve(name);
         long size = Files.size(file);
-
         boolean confined = context == IOContext.READONCE;
         Arena arena = confined ? Arena.ofConfined() : Arena.ofShared();
         int chunkSizePower = 34;
@@ -161,7 +159,7 @@ public final class CryptoMMapDirectory extends MMapDirectory {
             }
 
             try {
-                MemorySegment[] segments = mmapAndDecrypt(file, fd, size, arena, chunkSizePower, name);
+                MemorySegment[] segments = mmapAndDecrypt(file, fd, size, arena, chunkSizePower);
                 return MemorySegmentIndexInput
                     .newInstance("CryptoMemorySegmentIndexInput(path=\"" + file + "\")", arena, segments, size, chunkSizePower);
             } finally {
@@ -175,43 +173,9 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         }
     }
 
-    public MemorySegment[] mmapAndDecrypt(Path path, int fd, long size, Arena arena, int chunkSizePower, String name) throws Throwable {
+    public MemorySegment[] mmapAndDecrypt(Path path, int fd, long size, Arena arena, int chunkSizePower) throws Throwable {
         final long chunkSize = 1L << chunkSizePower;
-        final int numSegments = (int) ((size + chunkSize - 1) >>> chunkSizePower);
-
-        if (numSegments == 1 && size <= (8L << 20)) {
-            return decryptSmallFile(path, fd, size, arena, name);
-        }
-
-        else {
-            return decryptLargeFile(path, fd, size, arena, chunkSizePower, name);
-        }
-    }
-
-    private MemorySegment[] decryptSmallFile(Path path, int fd, long size, Arena arena, String name) throws Throwable {
-        final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
-        final byte[] iv = this.keyIvResolver.getIvBytes();
-
-        // mmap the file with read-only access
-        MemorySegment mmapSegment = (MemorySegment) MMAP.invoke(MemorySegment.NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (mmapSegment.address() == 0 || mmapSegment.address() == -1) {
-            throw new IOException("mmap failed for small file: " + path);
-        }
-
-        long start = System.nanoTime();
-
-        long addr = mmapSegment.address();
-        MemorySegment decrypted = OpenSslPanamaCipher.decryptInto(addr, size, key, iv, 0, arena);
-
-        long end = System.nanoTime();
-        // LOGGER.info("Fastest-path decryptInto of {} MiB for file {} took {} ms", size / 1048576.0, name, (end - start) / 1_000_000);
-
-        return new MemorySegment[] { decrypted };
-    }
-
-    private MemorySegment[] decryptLargeFile(Path path, int fd, long size, Arena arena, int chunkSizePower, String name) throws Throwable {
-        final long chunkSize = 1L << chunkSizePower;
-        final int numSegments = (int) ((size + chunkSize - 1) >>> chunkSizePower);
+        final int numSegments = (int) (size >>> chunkSizePower) + 1;
         MemorySegment[] segments = new MemorySegment[numSegments];
 
         long offset = 0;
@@ -219,13 +183,18 @@ public final class CryptoMMapDirectory extends MMapDirectory {
             long remaining = size - offset;
             long segmentSize = Math.min(chunkSize, remaining);
 
-            MemorySegment mmapSegment = (MemorySegment) MMAP
+            // Direct mmap call
+            MemorySegment addr = (MemorySegment) MMAP
                 .invoke(MemorySegment.NULL, segmentSize, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, offset);
-            if (mmapSegment.address() == 0 || mmapSegment.address() == -1) {
+
+            if (addr.address() == 0 || addr.address() == -1) {
                 throw new IOException("mmap failed at offset: " + offset);
             }
 
-            MemorySegment segment = MemorySegment.ofAddress(mmapSegment.address()).reinterpret(segmentSize, arena, null);
+            // Create segment directly in the arena's scope
+            MemorySegment segment = MemorySegment.ofAddress(addr.address()).reinterpret(segmentSize, arena, null);
+
+            // Decrypt in place
             decryptSegmentInPlaceParallel(segment, offset);
 
             segments[i] = segment;

@@ -8,6 +8,8 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.ByteBuffersDataOutput;
 import org.apache.lucene.store.ByteBuffersIndexInput;
 import org.apache.lucene.store.FilterIndexInput;
@@ -19,6 +21,8 @@ public final class MMapCryptoIndexInput extends FilterIndexInput {
 
     private final KeyIvResolver keyResolver;
     private final ByteBuffersDataOutput.ByteBufferRecycler recycler;
+
+    private static final Logger LOGGER = LogManager.getLogger(MMapCryptoIndexInput.class);
 
     public MMapCryptoIndexInput(String resourceDescription, IndexInput in, KeyIvResolver keyResolver) {
         super(resourceDescription, in);
@@ -45,6 +49,7 @@ public final class MMapCryptoIndexInput extends FilterIndexInput {
 
     @Override
     public void readBytes(byte[] b, int offset, int len) throws IOException {
+        LOGGER.info("Attempting to read bytes");
         try {
             byte[] tmp = new byte[len];
             in.readBytes(tmp, 0, len);

@@ -17,7 +17,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.LockFactory;
-import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.SuppressForbidden;
@@ -34,6 +33,7 @@ import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
 import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.store.mmap.CryptoMMapDirectory;
+import org.opensearch.index.store.mmap.CryptoMMapDirectoryLargeFiles;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 import org.opensearch.plugins.IndexStorePlugin;
 
@@ -124,11 +124,22 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                 LOGGER.debug("Using HYBRIDFS directory");
                 CryptoMMapDirectory cryptoMMapDirectory = new CryptoMMapDirectory(location, provider, keyIvResolver);
 
-                MMapDirectory mapDirectory = new MMapDirectory(location, lockFactory);
+                CryptoMMapDirectoryLargeFiles cryptoMMapDirectoryLargeFiles = new CryptoMMapDirectoryLargeFiles(
+                    location,
+                    provider,
+                    keyIvResolver
+                );
 
                 cryptoMMapDirectory.setPreloadExtensions(preLoadExtensions);
 
-                return new HybridCryptoDirectory(lockFactory, cryptoMMapDirectory, mapDirectory, provider, keyIvResolver, nioExtensions);
+                return new HybridCryptoDirectory(
+                    lockFactory,
+                    cryptoMMapDirectory,
+                    cryptoMMapDirectoryLargeFiles,
+                    provider,
+                    keyIvResolver,
+                    nioExtensions
+                );
             }
             case MMAPFS -> {
                 LOGGER.debug("Using MMAPFS directory");
