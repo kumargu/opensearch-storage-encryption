@@ -4,7 +4,6 @@
  */
 package org.opensearch.index.store.cipher;
 
-import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -164,44 +163,6 @@ public final class OpenSslPanamaCipher {
         return ivCopy;
     }
 
-    public static MemorySegment decryptInto(long srcAddr, long length, byte[] key, byte[] iv, long fileOffset, Arena arena)
-        throws Throwable {
-        if (key == null || key.length != AES_256_KEY_SIZE)
-            throw new IllegalArgumentException("Key must be 32 bytes for AES-256-CTR");
-        if (iv == null || iv.length != AES_BLOCK_SIZE)
-            throw new IllegalArgumentException("IV must be 16 bytes for AES-CTR");
-
-        MemorySegment ctx = (MemorySegment) EVP_CIPHER_CTX_new.invoke();
-        if (ctx.address() == 0)
-            throw new OpenSslException("EVP_CIPHER_CTX_new failed");
-
-        try {
-            MemorySegment cipher = (MemorySegment) EVP_aes_256_ctr.invoke();
-            if (cipher.address() == 0)
-                throw new OpenSslException("EVP_aes_256_ctr failed");
-
-            byte[] adjustedIV = computeOffsetIV(iv, fileOffset);
-            MemorySegment keySeg = arena.allocateArray(ValueLayout.JAVA_BYTE, key);
-            MemorySegment ivSeg = arena.allocateArray(ValueLayout.JAVA_BYTE, adjustedIV);
-
-            int rc = (int) EVP_EncryptInit_ex.invoke(ctx, cipher, MemorySegment.NULL, keySeg, ivSeg);
-            if (rc != 1)
-                throw new OpenSslException("EVP_EncryptInit_ex failed");
-
-            MemorySegment src = MemorySegment.ofAddress(srcAddr).reinterpret(length);
-            MemorySegment dst = arena.allocateArray(ValueLayout.JAVA_BYTE, (int) length);
-            MemorySegment outLen = arena.allocate(ValueLayout.JAVA_INT);
-
-            rc = (int) EVP_EncryptUpdate.invoke(ctx, dst, outLen, src, (int) length);
-            if (rc != 1)
-                throw new OpenSslException("EVP_EncryptUpdate failed");
-
-            return dst;
-        } finally {
-            EVP_CIPHER_CTX_free.invoke(ctx);
-        }
-    }
-
     /**
      * Encrypts the input data using AES-256-CTR mode.
      *
@@ -271,88 +232,6 @@ public final class OpenSslPanamaCipher {
             } finally {
                 EVP_CIPHER_CTX_free.invoke(ctx);
             }
-        }
-    }
-
-    public static void decryptInto(MemorySegment segment, long segmentOffset, int length, byte[] key, byte[] iv, byte[] outBuf, int outOff)
-        throws IOException {
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment in = arena.allocateArray(ValueLayout.JAVA_BYTE, length);
-            for (int i = 0; i < length; i++) {
-                in.setAtIndex(ValueLayout.JAVA_BYTE, i, segment.get(ValueLayout.JAVA_BYTE, segmentOffset + i));
-            }
-
-            byte[] adjustedIv = computeOffsetIV(iv, segmentOffset);
-            MemorySegment ctx = (MemorySegment) EVP_CIPHER_CTX_new.invoke();
-            if (ctx.address() == 0)
-                throw new OpenSslException("ctx creation failed");
-
-            try {
-                MemorySegment cipher = (MemorySegment) EVP_aes_256_ctr.invoke();
-                if (cipher.address() == 0)
-                    throw new OpenSslException("cipher fetch failed");
-
-                MemorySegment keySeg = arena.allocateArray(ValueLayout.JAVA_BYTE, key);
-                MemorySegment ivSeg = arena.allocateArray(ValueLayout.JAVA_BYTE, adjustedIv);
-                MemorySegment out = arena.allocateArray(ValueLayout.JAVA_BYTE, length);
-                MemorySegment outLen = arena.allocate(ValueLayout.JAVA_INT);
-
-                int rc = (int) EVP_EncryptInit_ex.invoke(ctx, cipher, MemorySegment.NULL, keySeg, ivSeg);
-                if (rc != 1)
-                    throw new OpenSslException("EncryptInit failed");
-
-                rc = (int) EVP_EncryptUpdate.invoke(ctx, out, outLen, in, length);
-                if (rc != 1)
-                    throw new OpenSslException("EncryptUpdate failed");
-
-                for (int i = 0; i < length; i++) {
-                    outBuf[outOff + i] = out.get(ValueLayout.JAVA_BYTE, i);
-                }
-            } finally {
-                EVP_CIPHER_CTX_free.invoke(ctx);
-            }
-        } catch (Throwable t) {
-            throw new IOException("Failed to decrypt block at offset " + segmentOffset + " with length " + length, t);
-        }
-    }
-
-    public static byte decryptByte(MemorySegment segment, byte[] key, byte[] iv, long absoluteOffset) throws IOException {
-        byte[] input = new byte[1];
-        input[0] = segment.get(ValueLayout.JAVA_BYTE, absoluteOffset);
-
-        byte[] output = new byte[1];
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment in = arena.allocateArray(ValueLayout.JAVA_BYTE, input);
-            MemorySegment out = arena.allocateArray(ValueLayout.JAVA_BYTE, output);
-            MemorySegment outLen = arena.allocate(ValueLayout.JAVA_INT);
-
-            byte[] adjustedIv = computeOffsetIV(iv, absoluteOffset);
-            MemorySegment ctx = (MemorySegment) EVP_CIPHER_CTX_new.invoke();
-            if (ctx.address() == 0)
-                throw new OpenSslException("ctx creation failed");
-
-            try {
-                MemorySegment cipher = (MemorySegment) EVP_aes_256_ctr.invoke();
-                if (cipher.address() == 0)
-                    throw new OpenSslException("cipher fetch failed");
-
-                MemorySegment keySeg = arena.allocateArray(ValueLayout.JAVA_BYTE, key);
-                MemorySegment ivSeg = arena.allocateArray(ValueLayout.JAVA_BYTE, adjustedIv);
-
-                int rc = (int) EVP_EncryptInit_ex.invoke(ctx, cipher, MemorySegment.NULL, keySeg, ivSeg);
-                if (rc != 1)
-                    throw new OpenSslException("EncryptInit failed");
-
-                rc = (int) EVP_EncryptUpdate.invoke(ctx, out, outLen, in, 1);
-                if (rc != 1)
-                    throw new OpenSslException("EncryptUpdate failed");
-
-                return out.get(ValueLayout.JAVA_BYTE, 0);
-            } finally {
-                EVP_CIPHER_CTX_free.invoke(ctx);
-            }
-        } catch (Throwable t) {
-            throw new IOException("Failed to decrypt single byte at offset " + absoluteOffset, t);
         }
     }
 
@@ -504,6 +383,49 @@ public final class OpenSslPanamaCipher {
             } finally {
                 EVP_CIPHER_CTX_free.invoke(ctx);
             }
+        }
+    }
+
+    public static void decryptInPlaceV2(Arena arena, long addr, long length, byte[] key, byte[] iv, long fileOffset) throws Throwable {
+        if (key == null || key.length != AES_256_KEY_SIZE)
+            throw new IllegalArgumentException("Key must be 32 bytes for AES-256-CTR");
+        if (iv == null || iv.length != AES_BLOCK_SIZE)
+            throw new IllegalArgumentException("IV must be 16 bytes for AES-CTR");
+
+        MemorySegment ctx = (MemorySegment) EVP_CIPHER_CTX_new.invoke();
+        if (ctx.address() == 0)
+            throw new OpenSslException("EVP_CIPHER_CTX_new failed");
+
+        try {
+            MemorySegment cipher = (MemorySegment) EVP_aes_256_ctr.invoke();
+            if (cipher.address() == 0)
+                throw new OpenSslException("EVP_aes_256_ctr failed");
+
+            byte[] adjustedIV = computeOffsetIV(iv, fileOffset);
+            MemorySegment keySeg = arena.allocateArray(ValueLayout.JAVA_BYTE, key);
+            MemorySegment ivSeg = arena.allocateArray(ValueLayout.JAVA_BYTE, adjustedIV);
+
+            int rc = (int) EVP_EncryptInit_ex.invoke(ctx, cipher, MemorySegment.NULL, keySeg, ivSeg);
+            if (rc != 1)
+                throw new OpenSslException("EVP_EncryptInit_ex failed");
+
+            int partialBlockOffset = (int) (fileOffset % AES_BLOCK_SIZE);
+            if (partialBlockOffset > 0) {
+                MemorySegment dummyIn = arena.allocateArray(ValueLayout.JAVA_BYTE, partialBlockOffset);
+                MemorySegment dummyOut = arena.allocate(partialBlockOffset + AES_BLOCK_SIZE);
+                MemorySegment dummyLen = arena.allocate(ValueLayout.JAVA_INT);
+                EVP_EncryptUpdate.invoke(ctx, dummyOut, dummyLen, dummyIn, partialBlockOffset);
+            }
+
+            MemorySegment inOut = MemorySegment.ofAddress(addr).reinterpret(length);
+            MemorySegment outLen = arena.allocate(ValueLayout.JAVA_INT);
+
+            rc = (int) EVP_EncryptUpdate.invoke(ctx, inOut, outLen, inOut, (int) length);
+            if (rc != 1)
+                throw new OpenSslException("EVP_EncryptUpdate failed");
+
+        } finally {
+            EVP_CIPHER_CTX_free.invoke(ctx);
         }
     }
 

@@ -29,6 +29,7 @@ import java.nio.file.Path;
 import java.security.Provider;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiPredicate;
 import java.util.stream.IntStream;
 
@@ -44,7 +45,7 @@ import org.opensearch.index.store.iv.KeyIvResolver;
 @SuppressWarnings("preview")
 @SuppressForbidden(reason = "temporary bypass")
 public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
-    private static final Logger LOGGER = LogManager.getLogger(CryptoMMapDirectory.class);
+    private static final Logger LOGGER = LogManager.getLogger(CryptoMMapDirectoryLargeFiles.class);
 
     private final KeyIvResolver keyIvResolver;
 
@@ -52,7 +53,17 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
     private static final int PROT_READ = 0x1;
     private static final int PROT_WRITE = 0x2;
     private static final int MAP_PRIVATE = 0x02;
+    public static final int MADV_WILLNEED = 3;
+    public static final int MADV_SEQUENTIAL = 2;
+
     private static final MethodHandle MMAP;
+    private static final MethodHandle MLOCK;
+    private static final MethodHandle MUNLOCK;
+    private static final MethodHandle MADVISE;
+
+    private static final long MAX_LOCKED_BYTES = 512L << 20; // 512 MiB max locked memory
+    private static final AtomicLong currentlyLockedBytes = new AtomicLong();
+
     private static final SymbolLookup LIBC = loadLibc();
 
     private static SymbolLookup loadLibc() {
@@ -103,8 +114,34 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
                             ValueLayout.JAVA_LONG // offset
                         )
                 );
+
+            MLOCK = LINKER
+                .downcallHandle(
+                    LIBC.find("mlock").orElseThrow(),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)
+                );
+
+            MADVISE = LINKER
+                .downcallHandle(
+                    LIBC.find("madvise").orElseThrow(),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT)
+                );
+
+            MUNLOCK = LINKER
+                .downcallHandle(
+                    LIBC.find("munlock").orElseThrow(),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)
+                );
+
         } catch (Throwable e) {
             throw new RuntimeException("Failed to load mmap", e);
+        }
+    }
+
+    public static void madvise(long address, long length, int advice) throws Throwable {
+        int rc = (int) MADVISE.invokeExact(MemorySegment.ofAddress(address), length, advice);
+        if (rc != 0) {
+            throw new RuntimeException("madvise failed with rc=" + rc);
         }
     }
 
@@ -144,7 +181,6 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
     public IndexInput openInput(String name, IOContext context) throws IOException {
         ensureOpen();
         ensureCanRead(name);
-
         Path file = getDirectory().resolve(name);
         long size = Files.size(file);
         boolean confined = context == IOContext.READONCE;
@@ -159,9 +195,16 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
             }
 
             try {
-                MemorySegment[] segments = mmapAndDecrypt(file, fd, size, arena, chunkSizePower);
+                MemorySegment[] segments = mmapAndDecrypt(file, fd, size, arena, chunkSizePower, name);
                 return MemorySegmentIndexInput
-                    .newInstance("CryptoMemorySegmentIndexInput(path=\"" + file + "\")", arena, segments, size, chunkSizePower);
+                    .newInstance(
+                        "CryptoMemorySegmentIndexInput(path=\"" + file + "\")",
+                        arena,
+                        segments,
+                        size,
+                        chunkSizePower,
+                        keyIvResolver
+                    );
             } finally {
                 // Close the file descriptor
                 closeFile(fd);
@@ -173,9 +216,10 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         }
     }
 
-    public MemorySegment[] mmapAndDecrypt(Path path, int fd, long size, Arena arena, int chunkSizePower) throws Throwable {
+    public MemorySegment[] mmapAndDecrypt(Path path, int fd, long size, Arena arena, int chunkSizePower, String name) throws Throwable {
         final long chunkSize = 1L << chunkSizePower;
-        final int numSegments = (int) (size >>> chunkSizePower) + 1;
+        final int numSegments = (int) ((size + chunkSize - 1) >>> chunkSizePower);
+
         MemorySegment[] segments = new MemorySegment[numSegments];
 
         long offset = 0;
@@ -191,11 +235,17 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
                 throw new IOException("mmap failed at offset: " + offset);
             }
 
-            // Create segment directly in the arena's scope
+            try {
+                madvise(addr.address(), segmentSize, MADV_WILLNEED);
+            } catch (Throwable t) {
+                LOGGER.warn("mlock/madvise failed at offset {} (ignored)", offset, t);
+            }
+
+            // Create MemorySegment in arena scope for Lucene usage
             MemorySegment segment = MemorySegment.ofAddress(addr.address()).reinterpret(segmentSize, arena, null);
 
-            // Decrypt in place
-            decryptSegmentInPlaceParallel(segment, offset);
+            // In-place decryption
+            decryptSegmentInPlaceParallel(segment, arena, offset, name);
 
             segments[i] = segment;
             offset += segmentSize;
@@ -204,7 +254,7 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         return segments;
     }
 
-    public void decryptSegmentInPlaceParallel(MemorySegment segment, long segmentOffsetInFile) throws Throwable {
+    public void decryptSegmentInPlaceParallel(MemorySegment segment, Arena arena, long segmentOffsetInFile, String name) throws Throwable {
         final long size = segment.byteSize();
 
         final int oneMB = 1 << 20; // 1 MiB
@@ -219,12 +269,11 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         // Fast-path: no parallelism for ≤ 2 MiB
         if (size <= (4L << 20)) {
             long start = System.nanoTime();
-            OpenSslPanamaCipher.decryptInPlace(segment.address(), size, key, iv, segmentOffsetInFile);
+            OpenSslPanamaCipher.decryptInPlaceV2(arena, segment.address(), size, key, iv, segmentOffsetInFile);
             long end = System.nanoTime();
             long durationMs = (end - start) / 1_000_000;
             // Optional logging
-            LOGGER.info("Fast-path decryption of {} MiB at offset {} took {} ms", size / 1048576.0, segmentOffsetInFile, durationMs);
-
+            // LOGGER.info("Fast-path decryption of {} MiB at offset {} took {} ms", size / 1048576.0, segmentOffsetInFile, durationMs);
             return;
         }
 
@@ -235,7 +284,7 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         } else if (size <= (16L << 20)) {
             chunkSize = fourMB;
         } else if (size <= (32L << 20)) {
-            chunkSize = eightMB;
+            chunkSize = fourMB;
         } else if (size <= (64L << 20)) {
             chunkSize = eightMB;
         } else {
@@ -261,15 +310,18 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         long endTime = System.nanoTime();
         long elapsedMs = (endTime - startTime) / 1_000_000;
 
-        // Optional logging
-        LOGGER
-            .info(
-                "Parallel decryption of {} chunks ({} MiB total) at offset {} took {} ms",
-                numChunks,
-                String.format("%.2f", size / 1048576.0),
-                segmentOffsetInFile,
-                elapsedMs
-            );
+        // if (size >= (8L << 20)) {
+        // // Optional logging
+        // LOGGER
+        // .info(
+        // "Parallel decryption of {} chunks ({} MiB total) at offset {} took {} ms file {}",
+        // numChunks,
+        // String.format("%.2f", size / 1048576.0),
+        // segmentOffsetInFile,
+        // elapsedMs,
+        // name
+        // );
+        // }
     }
 
     private static final MethodHandle OPEN;

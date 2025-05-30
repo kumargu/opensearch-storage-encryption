@@ -24,13 +24,18 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.Provider;
+import java.util.Arrays;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.BiPredicate;
-import java.util.stream.IntStream;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -38,21 +43,27 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.opensearch.common.SuppressForbidden;
-import org.opensearch.index.store.cipher.OpenSslPanamaCipher;
+import org.opensearch.index.store.cipher.CipherFactory;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 @SuppressWarnings("preview")
 @SuppressForbidden(reason = "temporary bypass")
 public final class CryptoMMapDirectory extends MMapDirectory {
+
     private static final Logger LOGGER = LogManager.getLogger(CryptoMMapDirectory.class);
 
     private final KeyIvResolver keyIvResolver;
 
     private static final Linker LINKER = Linker.nativeLinker();
-    private static final int PROT_READ = 0x1;
+    public static final int PROT_READ = 0x1;
     private static final int PROT_WRITE = 0x2;
     private static final int MAP_PRIVATE = 0x02;
     private static final MethodHandle MMAP;
+    private static final MethodHandle MADVISE;
+    public static final MethodHandle MPROTECT;
+    private static final MethodHandle GET_PAGE_SIZE;
+
+    public static final int MADV_WILLNEED = 3;
 
     private static final SymbolLookup LIBC = loadLibc();
 
@@ -104,8 +115,30 @@ public final class CryptoMMapDirectory extends MMapDirectory {
                             ValueLayout.JAVA_LONG // offset
                         )
                 );
+
+            MADVISE = LINKER
+                .downcallHandle(
+                    LIBC.find("madvise").orElseThrow(),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT)
+                );
+
+            MPROTECT = LINKER
+                .downcallHandle(
+                    LIBC.find("mprotect").orElseThrow(),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT)
+                );
+
+            GET_PAGE_SIZE = LINKER.downcallHandle(LIBC.find("getpagesize").orElseThrow(), FunctionDescriptor.of(ValueLayout.JAVA_INT));
         } catch (Throwable e) {
             throw new RuntimeException("Failed to load mmap", e);
+        }
+    }
+
+    public static int getPageSize() {
+        try {
+            return (int) GET_PAGE_SIZE.invokeExact();
+        } catch (Throwable e) {
+            return 4096; // fallback to common page size
         }
     }
 
@@ -141,6 +174,13 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         };
     }
 
+    public static void madvise(long address, long length, int advice) throws Throwable {
+        int rc = (int) MADVISE.invokeExact(MemorySegment.ofAddress(address), length, advice);
+        if (rc != 0) {
+            throw new RuntimeException("madvise failed with rc=" + rc);
+        }
+    }
+
     @Override
     public IndexInput openInput(String name, IOContext context) throws IOException {
         ensureOpen();
@@ -163,7 +203,14 @@ public final class CryptoMMapDirectory extends MMapDirectory {
             try {
                 MemorySegment[] segments = mmapAndDecrypt(file, fd, size, arena, chunkSizePower, name);
                 return MemorySegmentIndexInput
-                    .newInstance("CryptoMemorySegmentIndexInput(path=\"" + file + "\")", arena, segments, size, chunkSizePower);
+                    .newInstance(
+                        "CryptoMemorySegmentIndexInput(path=\"" + file + "\")",
+                        arena,
+                        segments,
+                        size,
+                        chunkSizePower,
+                        keyIvResolver
+                    );
             } finally {
                 // Close the file descriptor
                 closeFile(fd);
@@ -175,41 +222,7 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         }
     }
 
-    public MemorySegment[] mmapAndDecrypt(Path path, int fd, long size, Arena arena, int chunkSizePower, String name) throws Throwable {
-        final long chunkSize = 1L << chunkSizePower;
-        final int numSegments = (int) ((size + chunkSize - 1) >>> chunkSizePower);
-
-        if (numSegments == 1 && size <= (8L << 20)) {
-            return decryptSmallFile(path, fd, size, arena, name);
-        }
-
-        else {
-            return decryptLargeFile(path, fd, size, arena, chunkSizePower, name);
-        }
-    }
-
-    private MemorySegment[] decryptSmallFile(Path path, int fd, long size, Arena arena, String name) throws Throwable {
-        final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
-        final byte[] iv = this.keyIvResolver.getIvBytes();
-
-        // mmap the file with read-only access
-        MemorySegment mmapSegment = (MemorySegment) MMAP.invoke(MemorySegment.NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (mmapSegment.address() == 0 || mmapSegment.address() == -1) {
-            throw new IOException("mmap failed for small file: " + path);
-        }
-
-        long start = System.nanoTime();
-
-        long addr = mmapSegment.address();
-        MemorySegment decrypted = OpenSslPanamaCipher.decryptInto(addr, size, key, iv, 0, arena);
-
-        long end = System.nanoTime();
-        // LOGGER.info("Fastest-path decryptInto of {} MiB for file {} took {} ms", size / 1048576.0, name, (end - start) / 1_000_000);
-
-        return new MemorySegment[] { decrypted };
-    }
-
-    private MemorySegment[] decryptLargeFile(Path path, int fd, long size, Arena arena, int chunkSizePower, String name) throws Throwable {
+    private MemorySegment[] mmapAndDecrypt(Path path, int fd, long size, Arena arena, int chunkSizePower, String name) throws Throwable {
         final long chunkSize = 1L << chunkSizePower;
         final int numSegments = (int) ((size + chunkSize - 1) >>> chunkSizePower);
         MemorySegment[] segments = new MemorySegment[numSegments];
@@ -226,7 +239,6 @@ public final class CryptoMMapDirectory extends MMapDirectory {
             }
 
             MemorySegment segment = MemorySegment.ofAddress(mmapSegment.address()).reinterpret(segmentSize, arena, null);
-            decryptSegmentInPlaceParallel(segment, offset);
 
             segments[i] = segment;
             offset += segmentSize;
@@ -235,73 +247,105 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         return segments;
     }
 
-    public void decryptSegmentInPlaceParallel(MemorySegment segment, long segmentOffsetInFile) throws Throwable {
-        final long size = segment.byteSize();
-
-        final int oneMB = 1 << 20; // 1 MiB
-        final int twoMB = 1 << 21; // 2 MiB
-        final int fourMB = 1 << 22; // 4 MiB
-        final int eightMB = 1 << 23; // 8 MiB
-        final int sixteenMB = 1 << 24; // 16 MiB
-
+    private void decryptSegment(MemorySegment segment, long offset) throws Exception {
         final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
-        final byte[] iv = this.keyIvResolver.getIvBytes();
+        final byte[] baseIv = this.keyIvResolver.getIvBytes();
 
-        // Fast-path: no parallelism for ≤ 2 MiB
-        if (size <= (4L << 20)) {
-            long start = System.nanoTime();
-            OpenSslPanamaCipher.decryptInPlace(segment.address(), size, key, iv, segmentOffsetInFile);
-            long end = System.nanoTime();
-            long durationMs = (end - start) / 1_000_000;
-            // Optional logging
-            LOGGER.info("Fast-path decryption of {} MiB at offset {} took {} ms", size / 1048576.0, segmentOffsetInFile, durationMs);
+        Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
+        SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
+        byte[] ivCopy = Arrays.copyOf(baseIv, baseIv.length);
 
-            return;
+        int blockOffset = (int) (offset / CipherFactory.AES_BLOCK_SIZE_BYTES);
+        for (int i = CipherFactory.IV_ARRAY_LENGTH - 1; i >= CipherFactory.IV_ARRAY_LENGTH - CipherFactory.COUNTER_SIZE_BYTES; i--) {
+            ivCopy[i] = (byte) blockOffset;
+            blockOffset >>>= Byte.SIZE;
         }
 
-        // Choose adaptive chunk size
-        final int chunkSize;
-        if (size <= (8L << 20)) {
-            chunkSize = fourMB;
-        } else if (size <= (16L << 20)) {
-            chunkSize = fourMB;
-        } else if (size <= (32L << 20)) {
-            chunkSize = eightMB;
-        } else if (size <= (64L << 20)) {
-            chunkSize = eightMB;
-        } else {
-            chunkSize = sixteenMB;
-        }
+        cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(ivCopy));
 
-        final int numChunks = (int) ((size + chunkSize - 1) / chunkSize);
-        long startTime = System.nanoTime();
+        // Process the data in smaller chunks to avoid OOM
+        ByteBuffer buffer = segment.asByteBuffer();
+        final int CHUNK_SIZE = 16_384; // 8KB chunks
+        byte[] chunk = new byte[CHUNK_SIZE];
 
-        IntStream.range(0, numChunks).parallel().forEach(i -> {
-            long offset = (long) i * chunkSize;
-            long length = Math.min(chunkSize, size - offset);
-            long fileOffset = segmentOffsetInFile + offset;
-            long addr = segment.address() + offset;
+        int position = 0;
+        while (position < buffer.capacity()) {
+            int size = Math.min(CHUNK_SIZE, buffer.capacity() - position);
+            buffer.position(position);
+            buffer.get(chunk, 0, size);
 
-            try {
-                OpenSslPanamaCipher.decryptInPlace(addr, length, key, iv, fileOffset);
-            } catch (Throwable t) {
-                throw new RuntimeException("Decryption failed at offset: " + fileOffset, t);
+            byte[] decrypted;
+            if (position + size >= buffer.capacity()) {
+                // Last chunk
+                decrypted = cipher.doFinal(chunk, 0, size);
+            } else {
+                decrypted = cipher.update(chunk, 0, size);
             }
-        });
 
-        long endTime = System.nanoTime();
-        long elapsedMs = (endTime - startTime) / 1_000_000;
+            if (decrypted != null) {
+                buffer.position(position);
+                buffer.put(decrypted);
+            }
 
-        // Optional logging
-        LOGGER
-            .info(
-                "Parallel decryption of {} chunks ({} MiB total) at offset {} took {} ms",
-                numChunks,
-                String.format("%.2f", size / 1048576.0),
-                segmentOffsetInFile,
-                elapsedMs
-            );
+            position += size;
+        }
     }
+
+    // private void decryptSegment(MemorySegment segment, long offset) throws Exception {
+    // final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
+    // final byte[] baseIv = this.keyIvResolver.getIvBytes();
+
+    // Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
+    // SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
+    // byte[] ivCopy = Arrays.copyOf(baseIv, baseIv.length);
+
+    // int blockOffset = (int) (offset / CipherFactory.AES_BLOCK_SIZE_BYTES);
+    // for (int i = CipherFactory.IV_ARRAY_LENGTH - 1; i >= CipherFactory.IV_ARRAY_LENGTH - CipherFactory.COUNTER_SIZE_BYTES; i--) {
+    // ivCopy[i] = (byte) blockOffset;
+    // blockOffset >>>= Byte.SIZE;
+    // }
+
+    // cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(ivCopy));
+
+    // // Process the data in smaller chunks to avoid OOM
+    // ByteBuffer buffer = segment.asByteBuffer();
+
+    // final int CHUNK_SIZE = (segment.byteSize() <= (1 << 20)) ? 8_192 : 32_768;
+
+    // byte[] chunk = new byte[CHUNK_SIZE];
+
+    // long startTime = System.nanoTime();
+
+    // int position = 0;
+    // while (position < buffer.capacity()) {
+    // int size = Math.min(CHUNK_SIZE, buffer.capacity() - position);
+    // buffer.position(position);
+    // buffer.get(chunk, 0, size);
+
+    // byte[] decrypted;
+    // if (position + size >= buffer.capacity()) {
+    // // Last chunk
+    // decrypted = cipher.doFinal(chunk, 0, size);
+    // } else {
+    // decrypted = cipher.update(chunk, 0, size);
+    // }
+
+    // if (decrypted != null) {
+    // buffer.position(position);
+    // buffer.put(decrypted);
+    // }
+
+    // position += size;
+    // }
+
+    // final long size = segment.byteSize();
+
+    // long endTime = System.nanoTime();
+    // long elapsedMs = (endTime - startTime) / 1_000_000;
+
+    // // // Optional logging
+    // LOGGER.info(" SunJCE decryption of {} MiB took {} ms", size / 1048576.0, elapsedMs);
+    // }
 
     private static final MethodHandle OPEN;
     private static final MethodHandle CLOSE;
@@ -314,8 +358,8 @@ public final class CryptoMMapDirectory extends MMapDirectory {
                     FunctionDescriptor
                         .of(
                             ValueLayout.JAVA_INT,
-                            ValueLayout.ADDRESS,    // const char *pathname
-                            ValueLayout.JAVA_INT    // int flags
+                            ValueLayout.ADDRESS, // const char *pathname
+                            ValueLayout.JAVA_INT // int flags
                         )
                 );
 
@@ -325,7 +369,7 @@ public final class CryptoMMapDirectory extends MMapDirectory {
                     FunctionDescriptor
                         .of(
                             ValueLayout.JAVA_INT,
-                            ValueLayout.JAVA_INT    // int fd
+                            ValueLayout.JAVA_INT // int fd
                         )
                 );
         } catch (Throwable e) {
