@@ -5,11 +5,14 @@
 package org.opensearch.index.store.hybrid;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.Provider;
 import java.util.Set;
 
 import org.apache.lucene.store.FileSwitchDirectory;
 import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IOContext.Context;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.LockFactory;
 import org.opensearch.common.util.io.IOUtils;
@@ -70,7 +73,7 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
                 "kdd"
             );
         this.smallFileExtensions = Set.of();
-        this.largeFileExtensions = Set.of();
+        this.largeFileExtensions = Set.of("kdd", "kdi", "kdm", "cfs");
     }
 
     @Override
@@ -80,14 +83,19 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
 
         String extension = FileSwitchDirectory.getExtension(name);
 
-        // if (extension != null && largeFileExtensions.contains(extension)) {
-        // return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
-        // }
-
-        if (extension != null && smallFileExtensions.contains(extension)) {
-            return delegate.openInput(name, context);
+        if (context.context() == Context.MERGE) {
+            // Use NIOFS for merge reads - sequential, one-time
+            return super.openInput(name, context);
         }
 
+        Path file = getDirectory().resolve(name);
+        long size = Files.size(file);
+
+        if (size <= (2L << 20) && largeFileExtensions.contains(extension)) {
+            return delegate.openInput(name, context);
+        } else if (size > (2L << 20) && largeFileExtensions.contains(extension)) {
+            return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+        }
         else {
             // Default to CryptoNIOFSDirectory
             return super.openInput(name, context);

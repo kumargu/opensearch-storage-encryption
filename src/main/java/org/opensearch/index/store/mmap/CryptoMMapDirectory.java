@@ -24,18 +24,14 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
-import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.Provider;
-import java.util.Arrays;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiPredicate;
-
-import javax.crypto.Cipher;
-import javax.crypto.spec.IvParameterSpec;
-import javax.crypto.spec.SecretKeySpec;
+import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -43,7 +39,6 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.opensearch.common.SuppressForbidden;
-import org.opensearch.index.store.cipher.CipherFactory;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 @SuppressWarnings("preview")
@@ -63,9 +58,15 @@ public final class CryptoMMapDirectory extends MMapDirectory {
     public static final MethodHandle MPROTECT;
     private static final MethodHandle GET_PAGE_SIZE;
 
-    public static final int MADV_WILLNEED = 3;
+    private static final int MADV_NORMAL = 0;
+    private static final int MADV_POPULATE_WRITE = 23;
 
     private static final SymbolLookup LIBC = loadLibc();
+
+    private Function<String, Optional<String>> groupingFunction = GROUP_BY_SEGMENT;
+    private final ConcurrentHashMap<String, RefCountedSharedArena> arenas = new ConcurrentHashMap<>();
+
+    private static final int SHARED_ARENA_PERMITS = checkMaxPermits(getSharedArenaMaxPermitsSysprop());
 
     private static SymbolLookup loadLibc() {
         String os = System.getProperty("os.name").toLowerCase();
@@ -181,6 +182,85 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         }
     }
 
+    /**
+    * Configures a grouping function for files that are part of the same logical group. 
+    * The gathering of files into a logical group is a hint that allows for better 
+    * handling of resources.
+    *
+    * <p>By default, grouping is {@link #GROUP_BY_SEGMENT}. To disable, invoke this 
+    * method with {@link #NO_GROUPING}.
+    *
+    * @param groupingFunction a function that accepts a file name and returns an 
+    *     optional group key. If the optional is present, then its value is the 
+    *     logical group to which the file belongs. Otherwise, the file name is not 
+    *     associated with any logical group.
+    */
+    public void setGroupingFunction(Function<String, Optional<String>> groupingFunction) {
+        this.groupingFunction = groupingFunction;
+    }
+
+    /**
+     * Gets the current grouping function.
+     */
+    public Function<String, Optional<String>> getGroupingFunction() {
+        return this.groupingFunction;
+    }
+
+    /**
+    * Gets an arena for the given filename, potentially aggregating files from the same segment into
+    * a single ref counted shared arena. A ref counted shared arena, if created will be added to the
+    * given arenas map.
+    */
+    private Arena getSharedArena(String name, ConcurrentHashMap<String, RefCountedSharedArena> arenas) {
+        final var group = groupingFunction.apply(name);
+
+        if (group.isEmpty()) {
+            return Arena.ofShared();
+        }
+
+        String key = group.get();
+        var refCountedArena = arenas.computeIfAbsent(key, s -> new RefCountedSharedArena(s, () -> arenas.remove(s), SHARED_ARENA_PERMITS));
+        if (refCountedArena.acquire()) {
+            return refCountedArena;
+        } else {
+            return arenas.compute(key, (s, v) -> {
+                if (v != null && v.acquire()) {
+                    return v;
+                } else {
+                    v = new RefCountedSharedArena(s, () -> arenas.remove(s), SHARED_ARENA_PERMITS);
+                    v.acquire(); // guaranteed to succeed
+                    return v;
+                }
+            });
+        }
+    }
+
+    private static int getSharedArenaMaxPermitsSysprop() {
+        int ret = 1024; // default value
+        try {
+            String str = System.getProperty(SHARED_ARENA_MAX_PERMITS_SYSPROP);
+            if (str != null) {
+                ret = Integer.parseInt(str);
+            }
+        } catch (@SuppressWarnings("unused") NumberFormatException | SecurityException ignored) {
+            LOGGER.warn("Cannot read sysprop " + SHARED_ARENA_MAX_PERMITS_SYSPROP + ", so the default value will be used.");
+        }
+        return ret;
+    }
+
+    private static int checkMaxPermits(int maxPermits) {
+        if (RefCountedSharedArena.validMaxPermits(maxPermits)) {
+            return maxPermits;
+        }
+        LOGGER
+            .warn(
+                "Invalid value for sysprop "
+                    + MMapDirectory.SHARED_ARENA_MAX_PERMITS_SYSPROP
+                    + ", must be positive and <= 0x07FF. The default value will be used."
+            );
+        return RefCountedSharedArena.DEFAULT_MAX_PERMITS;
+    }
+
     @Override
     public IndexInput openInput(String name, IOContext context) throws IOException {
         ensureOpen();
@@ -191,6 +271,9 @@ public final class CryptoMMapDirectory extends MMapDirectory {
 
         boolean confined = context == IOContext.READONCE;
         Arena arena = confined ? Arena.ofConfined() : Arena.ofShared();
+
+        // final Arena arena = confined ? Arena.ofConfined() : getSharedArena(name, arenas);
+
         int chunkSizePower = 34;
 
         try {
@@ -201,8 +284,8 @@ public final class CryptoMMapDirectory extends MMapDirectory {
             }
 
             try {
-                MemorySegment[] segments = mmapAndDecrypt(file, fd, size, arena, chunkSizePower, name);
-                return MemorySegmentIndexInput
+                MemorySegment[] segments = mmapAndDecrypt(file, fd, size, arena, chunkSizePower, name, context);
+                return CryptoMemorySegmentIndexInput
                     .newInstance(
                         "CryptoMemorySegmentIndexInput(path=\"" + file + "\")",
                         arena,
@@ -222,10 +305,15 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         }
     }
 
-    private MemorySegment[] mmapAndDecrypt(Path path, int fd, long size, Arena arena, int chunkSizePower, String name) throws Throwable {
+    private MemorySegment[] mmapAndDecrypt(Path path, int fd, long size, Arena arena, int chunkSizePower, String name, IOContext context)
+        throws Throwable {
         final long chunkSize = 1L << chunkSizePower;
         final int numSegments = (int) ((size + chunkSize - 1) >>> chunkSizePower);
         MemorySegment[] segments = new MemorySegment[numSegments];
+
+        // Get madvise flags once - they don't change per segment
+        boolean shouldPreload = LuceneIOContextMAdvise.shouldPreload(name, size);
+        int madviseFlags = LuceneIOContextMAdvise.getMAdviseFlags(context, name);
 
         long offset = 0;
         for (int i = 0; i < numSegments; i++) {
@@ -238,6 +326,33 @@ public final class CryptoMMapDirectory extends MMapDirectory {
                 throw new IOException("mmap failed at offset: " + offset);
             }
 
+            LOGGER.info("File size {}", segmentSize / 1048576.0);
+
+            // if (segmentSize <= (2L << 20)) { // Small segment - try to populate
+            // if (mmapSegment.address() % getPageSize() == 0) {
+            // try {
+            // madvise(mmapSegment.address(), segmentSize, MADV_POPULATE_WRITE);
+            // } catch (Throwable t) {
+            // LOGGER.warn("MADV_POPULATE_WRITE failed for {}: {}", name, t.getMessage());
+            // }
+            // } else {
+            // LOGGER.warn("Skipping POPULATE_WRITE for {} - address not page aligned", name);
+            // // Could still do touchPages here if critical
+            // }
+            // } else if (madviseFlags != MADV_NORMAL && mmapSegment.address() % getPageSize() == 0) {
+            // try {
+            // madvise(mmapSegment.address(), segmentSize, madviseFlags);
+            // } catch (Throwable t) {
+            // LOGGER.warn("madvise failed for {} at context {} advise: {}", name, context, madviseFlags, t);
+            // }
+            // }
+
+            try {
+                madvise(mmapSegment.address(), segmentSize, madviseFlags);
+            } catch (Throwable t) {
+                LOGGER.warn("madvise failed for {} at context {} advise: {}", name, context, madviseFlags, t);
+            }
+
             MemorySegment segment = MemorySegment.ofAddress(mmapSegment.address()).reinterpret(segmentSize, arena, null);
 
             segments[i] = segment;
@@ -246,106 +361,6 @@ public final class CryptoMMapDirectory extends MMapDirectory {
 
         return segments;
     }
-
-    private void decryptSegment(MemorySegment segment, long offset) throws Exception {
-        final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
-        final byte[] baseIv = this.keyIvResolver.getIvBytes();
-
-        Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
-        SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
-        byte[] ivCopy = Arrays.copyOf(baseIv, baseIv.length);
-
-        int blockOffset = (int) (offset / CipherFactory.AES_BLOCK_SIZE_BYTES);
-        for (int i = CipherFactory.IV_ARRAY_LENGTH - 1; i >= CipherFactory.IV_ARRAY_LENGTH - CipherFactory.COUNTER_SIZE_BYTES; i--) {
-            ivCopy[i] = (byte) blockOffset;
-            blockOffset >>>= Byte.SIZE;
-        }
-
-        cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(ivCopy));
-
-        // Process the data in smaller chunks to avoid OOM
-        ByteBuffer buffer = segment.asByteBuffer();
-        final int CHUNK_SIZE = 16_384; // 8KB chunks
-        byte[] chunk = new byte[CHUNK_SIZE];
-
-        int position = 0;
-        while (position < buffer.capacity()) {
-            int size = Math.min(CHUNK_SIZE, buffer.capacity() - position);
-            buffer.position(position);
-            buffer.get(chunk, 0, size);
-
-            byte[] decrypted;
-            if (position + size >= buffer.capacity()) {
-                // Last chunk
-                decrypted = cipher.doFinal(chunk, 0, size);
-            } else {
-                decrypted = cipher.update(chunk, 0, size);
-            }
-
-            if (decrypted != null) {
-                buffer.position(position);
-                buffer.put(decrypted);
-            }
-
-            position += size;
-        }
-    }
-
-    // private void decryptSegment(MemorySegment segment, long offset) throws Exception {
-    // final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
-    // final byte[] baseIv = this.keyIvResolver.getIvBytes();
-
-    // Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
-    // SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
-    // byte[] ivCopy = Arrays.copyOf(baseIv, baseIv.length);
-
-    // int blockOffset = (int) (offset / CipherFactory.AES_BLOCK_SIZE_BYTES);
-    // for (int i = CipherFactory.IV_ARRAY_LENGTH - 1; i >= CipherFactory.IV_ARRAY_LENGTH - CipherFactory.COUNTER_SIZE_BYTES; i--) {
-    // ivCopy[i] = (byte) blockOffset;
-    // blockOffset >>>= Byte.SIZE;
-    // }
-
-    // cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(ivCopy));
-
-    // // Process the data in smaller chunks to avoid OOM
-    // ByteBuffer buffer = segment.asByteBuffer();
-
-    // final int CHUNK_SIZE = (segment.byteSize() <= (1 << 20)) ? 8_192 : 32_768;
-
-    // byte[] chunk = new byte[CHUNK_SIZE];
-
-    // long startTime = System.nanoTime();
-
-    // int position = 0;
-    // while (position < buffer.capacity()) {
-    // int size = Math.min(CHUNK_SIZE, buffer.capacity() - position);
-    // buffer.position(position);
-    // buffer.get(chunk, 0, size);
-
-    // byte[] decrypted;
-    // if (position + size >= buffer.capacity()) {
-    // // Last chunk
-    // decrypted = cipher.doFinal(chunk, 0, size);
-    // } else {
-    // decrypted = cipher.update(chunk, 0, size);
-    // }
-
-    // if (decrypted != null) {
-    // buffer.position(position);
-    // buffer.put(decrypted);
-    // }
-
-    // position += size;
-    // }
-
-    // final long size = segment.byteSize();
-
-    // long endTime = System.nanoTime();
-    // long elapsedMs = (endTime - startTime) / 1_000_000;
-
-    // // // Optional logging
-    // LOGGER.info(" SunJCE decryption of {} MiB took {} ms", size / 1048576.0, elapsedMs);
-    // }
 
     private static final MethodHandle OPEN;
     private static final MethodHandle CLOSE;
