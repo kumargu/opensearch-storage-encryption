@@ -326,8 +326,6 @@ public final class CryptoMMapDirectory extends MMapDirectory {
                 throw new IOException("mmap failed at offset: " + offset);
             }
 
-            LOGGER.info("File size {}", segmentSize / 1048576.0);
-
             // if (segmentSize <= (2L << 20)) { // Small segment - try to populate
             // if (mmapSegment.address() % getPageSize() == 0) {
             // try {

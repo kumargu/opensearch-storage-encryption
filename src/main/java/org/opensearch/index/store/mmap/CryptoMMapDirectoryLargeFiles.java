@@ -496,7 +496,7 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         // Choose adaptive chunk size
         final int chunkSize;
         if (size <= (8L << 20)) {
-            chunkSize = fourMB;
+            chunkSize = twoMB;
         } else if (size <= (16L << 20)) {
             chunkSize = fourMB;
         } else if (size <= (32L << 20)) {
