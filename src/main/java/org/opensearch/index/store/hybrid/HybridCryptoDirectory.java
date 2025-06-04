@@ -60,17 +60,17 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
                 "fdx",
                 "vem",
                 "fdm",
-                "kdm",
-                "kdi",
+                // "kdm",
+                // "kdi",
                 "psm",
                 "tmd",
                 "tip",
                 "nvd",
-                "cfs",
+                // "cfs",
                 "tim",
                 "doc",
-                "dvd",
-                "kdd"
+                "dvd"
+                // "kdd"
             );
         this.smallFileExtensions = Set.of();
         this.largeFileExtensions = Set.of("kdd", "kdi", "kdm", "cfs");
@@ -95,8 +95,7 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
             return delegate.openInput(name, context);
         } else if (size > (2L << 20) && largeFileExtensions.contains(extension)) {
             return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
-        }
-        else {
+        } else {
             // Default to CryptoNIOFSDirectory
             return super.openInput(name, context);
         }
