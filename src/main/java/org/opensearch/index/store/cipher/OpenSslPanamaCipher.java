@@ -235,6 +235,47 @@ public final class OpenSslPanamaCipher {
         }
     }
 
+    public static MemorySegment decryptInto(long srcAddr, long length, byte[] key, byte[] iv, long fileOffset, Arena arena)
+        throws Throwable {
+        if (key == null || key.length != AES_256_KEY_SIZE)
+            throw new IllegalArgumentException("Key must be 32 bytes for AES-256-CTR");
+        if (iv == null || iv.length != AES_BLOCK_SIZE)
+            throw new IllegalArgumentException("IV must be 16 bytes for AES-CTR");
+
+        MemorySegment ctx = (MemorySegment) EVP_CIPHER_CTX_new.invoke();
+        if (ctx.address() == 0)
+            throw new OpenSslException("EVP_CIPHER_CTX_new failed");
+
+        try {
+            MemorySegment cipher = (MemorySegment) EVP_aes_256_ctr.invoke();
+            if (cipher.address() == 0)
+                throw new OpenSslException("EVP_aes_256_ctr failed");
+
+            byte[] adjustedIV = computeOffsetIV(iv, fileOffset);
+            MemorySegment keySeg = arena.allocateArray(ValueLayout.JAVA_BYTE, key);
+            MemorySegment ivSeg = arena.allocateArray(ValueLayout.JAVA_BYTE, adjustedIV);
+
+            int rc = (int) EVP_EncryptInit_ex.invoke(ctx, cipher, MemorySegment.NULL, keySeg, ivSeg);
+            if (rc != 1)
+                throw new OpenSslException("EVP_EncryptInit_ex failed");
+
+            // Direct mapping of source
+            MemorySegment src = MemorySegment.ofAddress(srcAddr).reinterpret(length);
+
+            // Allocate native memory for decrypted data
+            MemorySegment dst = arena.allocate(length);
+            MemorySegment outLen = arena.allocate(ValueLayout.JAVA_INT);
+
+            rc = (int) EVP_EncryptUpdate.invoke(ctx, dst, outLen, src, (int) length);
+            if (rc != 1)
+                throw new OpenSslException("EVP_EncryptUpdate failed");
+
+            return dst;
+        } finally {
+            EVP_CIPHER_CTX_free.invoke(ctx);
+        }
+    }
+
     /**
     * Decrypts the input data using AES-256-CTR mode.
     * This method is symmetric with `encrypt(...)` because AES-CTR uses the same function for encryption and decryption.

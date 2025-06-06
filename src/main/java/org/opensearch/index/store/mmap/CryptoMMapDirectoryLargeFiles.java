@@ -365,50 +365,6 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         return segments;
     }
 
-    // private void decryptSegment(MemorySegment segment, long offset) throws Exception {
-    // final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
-    // final byte[] baseIv = this.keyIvResolver.getIvBytes();
-
-    // Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
-    // SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
-    // byte[] ivCopy = Arrays.copyOf(baseIv, baseIv.length);
-
-    // int blockOffset = (int) (offset / CipherFactory.AES_BLOCK_SIZE_BYTES);
-    // for (int i = CipherFactory.IV_ARRAY_LENGTH - 1; i >= CipherFactory.IV_ARRAY_LENGTH - CipherFactory.COUNTER_SIZE_BYTES; i--) {
-    // ivCopy[i] = (byte) blockOffset;
-    // blockOffset >>>= Byte.SIZE;
-    // }
-
-    // cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(ivCopy));
-
-    // // Process the data in smaller chunks to avoid OOM
-    // ByteBuffer buffer = segment.asByteBuffer();
-    // final int CHUNK_SIZE = 16_384; // 8KB chunks
-    // byte[] chunk = new byte[CHUNK_SIZE];
-
-    // int position = 0;
-    // while (position < buffer.capacity()) {
-    // int size = Math.min(CHUNK_SIZE, buffer.capacity() - position);
-    // buffer.position(position);
-    // buffer.get(chunk, 0, size);
-
-    // byte[] decrypted;
-    // if (position + size >= buffer.capacity()) {
-    // // Last chunk
-    // decrypted = cipher.doFinal(chunk, 0, size);
-    // } else {
-    // decrypted = cipher.update(chunk, 0, size);
-    // }
-
-    // if (decrypted != null) {
-    // buffer.position(position);
-    // buffer.put(decrypted);
-    // }
-
-    // position += size;
-    // }
-    // }
-
     private void decryptSegment(MemorySegment segment, long offset) throws Exception {
         final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
         final byte[] baseIv = this.keyIvResolver.getIvBytes();
@@ -461,7 +417,6 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         long endTime = System.nanoTime();
         long elapsedMs = (endTime - startTime) / 1_000_000;
 
-        // // Optional logging
         // LOGGER.info(" SunJCE decryption of {} MiB took {} ms", size / 1048576.0, elapsedMs);
     }
 
@@ -487,7 +442,6 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
 
             long end = System.nanoTime();
             long durationMs = (end - start) / 1_000_000;
-            // Optional logging
             // LOGGER.info("Fast-path decryption of {} MiB at offset {} took {} ms", size / 1048576.0, segmentOffsetInFile, durationMs);
 
             return;
@@ -526,7 +480,6 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         long endTime = System.nanoTime();
         long elapsedMs = (endTime - startTime) / 1_000_000;
 
-        // Optional logging
         // LOGGER
         // .info(
         // "Parallel decryption of {} chunks ({} MiB total) at offset {} took {} ms",
