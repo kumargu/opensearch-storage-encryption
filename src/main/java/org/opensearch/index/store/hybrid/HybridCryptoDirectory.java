@@ -50,7 +50,7 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
         this.cryptoMMapDirectoryLargeFilesDelegate = cryptoMMapDirectoryLargeFilesDelegate;
         this.nioExtensions = nioExtensions;
         // Only these files get special treatment
-        this.specialExtensions = Set.of("kdd", "kdi", "kdm", "cfs", "tip", "tim", "tmd");
+        this.specialExtensions = Set.of("kdd", "kdi", "kdm", "tip", "tim", "tmd", "cfs");
     }
 
     @Override
@@ -103,6 +103,15 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
             return delegate.openInput(name, context);
         }
 
+        if (fileSize <= (2L << 20)) {
+          return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+        }
+
+        if (fileSize >= (64L << 20)) {
+            LOGGER.info("Routing LARGE files {} to LargeFilesDelegate {}", name, fileSize / 1048576.0);
+            return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+        }
+
         // Route based on file type and access patterns
         switch (extension) {
             case "tim", "tip", "tmd" -> {
@@ -127,24 +136,11 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
             case "kdd" -> {
                 // BKD tree leaf data: Hybrid access pattern
                 // Random access to leaf blocks, sequential within blocks
-                if (fileSize < MEDIUM_FILE_THRESHOLD) {
-                    LOGGER.debug("Routing small/medium KDD {} to MMap for hybrid access", name);
-                    return delegate.openInput(name, context);
-                } else {
-                    LOGGER.debug("Routing large KDD {} to specialized large file handler", name);
-                    return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
-                }
+                return delegate.openInput(name, context);
             }
 
             case "cfs" -> {
-                // Compound files: Mixed access patterns, can be very large
-                if (fileSize > MEDIUM_FILE_THRESHOLD) {
-                    LOGGER.debug("Routing large compound file {} to specialized handler", name);
-                    return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
-                } else {
-                    LOGGER.debug("Routing compound file {} to MMap", name);
-                    return delegate.openInput(name, context);
-                }
+                return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
             }
 
             default -> {
