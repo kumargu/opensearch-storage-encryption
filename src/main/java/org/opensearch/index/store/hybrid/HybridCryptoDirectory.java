@@ -50,7 +50,7 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
         this.cryptoMMapDirectoryLargeFilesDelegate = cryptoMMapDirectoryLargeFilesDelegate;
         this.nioExtensions = nioExtensions;
         // Only these files get special treatment
-        this.specialExtensions = Set.of("kdd", "kdi", "kdm", "tip", "tim", "tmd", "cfs");
+        this.specialExtensions = Set.of("kdd", "kdi", "kdm", "tip", "tim", "tmd");
     }
 
     @Override
@@ -103,11 +103,11 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
             return delegate.openInput(name, context);
         }
 
-        if (fileSize <= (2L << 20)) {
-          return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+        if ((fileSize >= (2L << 20)) && (fileSize <= (4L << 20))) {
+            return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
         }
 
-        if (fileSize >= (64L << 20)) {
+        if (fileSize >= (32L << 20)) {
             LOGGER.info("Routing LARGE files {} to LargeFilesDelegate {}", name, fileSize / 1048576.0);
             return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
         }
