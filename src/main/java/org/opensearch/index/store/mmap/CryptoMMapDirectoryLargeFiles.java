@@ -433,7 +433,7 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         final byte[] iv = this.keyIvResolver.getIvBytes();
 
         // Fast-path: no parallelism for ≤ 2 MiB
-        if (size <= (4L << 20)) {
+        if (size <= (8L << 20)) {
             long start = System.nanoTime();
 
             // OpenSslPanamaCipher.decryptInPlaceV2(arena, segment.address(), size, key, iv, segmentOffsetInFile);

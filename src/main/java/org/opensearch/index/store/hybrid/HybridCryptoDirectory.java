@@ -103,7 +103,7 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
             return delegate.openInput(name, context);
         }
 
-        if ((fileSize >= (2L << 20)) && (fileSize <= (4L << 20))) {
+        if ((fileSize >= (2L << 20)) && (fileSize <= (8L << 20))) {
             return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
         }
 
