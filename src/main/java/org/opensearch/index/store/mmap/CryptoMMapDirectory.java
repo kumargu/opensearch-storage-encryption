@@ -58,9 +58,6 @@ public final class CryptoMMapDirectory extends MMapDirectory {
     public static final MethodHandle MPROTECT;
     private static final MethodHandle GET_PAGE_SIZE;
 
-    private static final int MADV_NORMAL = 0;
-    private static final int MADV_POPULATE_WRITE = 23;
-
     private static final SymbolLookup LIBC = loadLibc();
 
     private Function<String, Optional<String>> groupingFunction = GROUP_BY_SEGMENT;
@@ -130,7 +127,7 @@ public final class CryptoMMapDirectory extends MMapDirectory {
                 );
 
             GET_PAGE_SIZE = LINKER.downcallHandle(LIBC.find("getpagesize").orElseThrow(), FunctionDescriptor.of(ValueLayout.JAVA_INT));
-        } catch (Throwable e) {
+        } catch (RuntimeException e) {
             throw new RuntimeException("Failed to load mmap", e);
         }
     }
@@ -292,7 +289,8 @@ public final class CryptoMMapDirectory extends MMapDirectory {
                         segments,
                         size,
                         chunkSizePower,
-                        keyIvResolver
+                        keyIvResolver.getDataKey().getEncoded(),
+                        keyIvResolver.getIvBytes()
                     );
             } finally {
                 // Close the file descriptor
@@ -311,8 +309,6 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         final int numSegments = (int) ((size + chunkSize - 1) >>> chunkSizePower);
         MemorySegment[] segments = new MemorySegment[numSegments];
 
-        // Get madvise flags once - they don't change per segment
-        boolean shouldPreload = LuceneIOContextMAdvise.shouldPreload(name, size);
         int madviseFlags = LuceneIOContextMAdvise.getMAdviseFlags(context, name);
 
         long offset = 0;
@@ -325,25 +321,6 @@ public final class CryptoMMapDirectory extends MMapDirectory {
             if (mmapSegment.address() == 0 || mmapSegment.address() == -1) {
                 throw new IOException("mmap failed at offset: " + offset);
             }
-
-            // if (segmentSize <= (2L << 20)) { // Small segment - try to populate
-            // if (mmapSegment.address() % getPageSize() == 0) {
-            // try {
-            // madvise(mmapSegment.address(), segmentSize, MADV_POPULATE_WRITE);
-            // } catch (Throwable t) {
-            // LOGGER.warn("MADV_POPULATE_WRITE failed for {}: {}", name, t.getMessage());
-            // }
-            // } else {
-            // LOGGER.warn("Skipping POPULATE_WRITE for {} - address not page aligned", name);
-            // // Could still do touchPages here if critical
-            // }
-            // } else if (madviseFlags != MADV_NORMAL && mmapSegment.address() % getPageSize() == 0) {
-            // try {
-            // madvise(mmapSegment.address(), segmentSize, madviseFlags);
-            // } catch (Throwable t) {
-            // LOGGER.warn("madvise failed for {} at context {} advise: {}", name, context, madviseFlags, t);
-            // }
-            // }
 
             try {
                 madvise(mmapSegment.address(), segmentSize, madviseFlags);

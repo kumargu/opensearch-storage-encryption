@@ -21,10 +21,11 @@ import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.ArrayUtil;
+import org.opensearch.common.SuppressForbidden;
 import org.opensearch.index.store.cipher.HybridCipher;
 import org.opensearch.index.store.concurrency.AtomicBitSet;
-import org.opensearch.index.store.iv.KeyIvResolver;
 
+@SuppressForbidden(reason = "temporary bypass")
 @SuppressWarnings("preview")
 public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomAccessInput {
 
@@ -36,12 +37,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
     static final ValueLayout.OfLong LAYOUT_LE_LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     static final ValueLayout.OfFloat LAYOUT_LE_FLOAT = ValueLayout.JAVA_FLOAT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
-    final long length;
+    final long resourceLength;
     final long chunkSizeMask;
     final int chunkSizePower;
     final Arena arena;
     final MemorySegment[] segments;
-    final KeyIvResolver keyIvResolver;
+    final byte[] key;
+    final byte[] iv;
     final AtomicBitSet decryptedPages;
     final String resourceDescription;
     final long decryptionBaseOffset;
@@ -55,12 +57,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
         String resourceDescription,
         Arena arena,
         MemorySegment[] segments,
-        long length,
+        long resourceLength,
         int chunkSizePower,
-        KeyIvResolver keyIvResolver
+        byte[] key,
+        byte[] iv
     ) {
 
-        long totalPages = (length + getPageSize() - 1) / getPageSize();
+        long totalPages = (resourceLength + getPageSize() - 1) / getPageSize();
         AtomicBitSet decryptedPages = new AtomicBitSet(totalPages);
 
         assert Arrays.stream(segments).map(MemorySegment::scope).allMatch(arena.scope()::equals);
@@ -70,14 +73,26 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
                 resourceDescription,
                 arena,
                 segments[0],
-                length,
+                resourceLength,
                 chunkSizePower,
-                keyIvResolver,
+                key,
+                iv,
                 decryptedPages,
                 0L
             );
         } else {
-            return new MultiSegmentImpl(resourceDescription, arena, segments, 0, length, chunkSizePower, keyIvResolver, decryptedPages, 0L);
+            return new MultiSegmentImpl(
+                resourceDescription,
+                arena,
+                segments,
+                0,
+                resourceLength,
+                chunkSizePower,
+                key,
+                iv,
+                decryptedPages,
+                0L
+            );
         }
 
     }
@@ -86,20 +101,22 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
         String resourceDescription,
         Arena arena,
         MemorySegment[] segments,
-        long length,
+        long resourceLength,
         int chunkSizePower,
-        KeyIvResolver keyIvResolver,
+        byte[] key,
+        byte[] iv,
         AtomicBitSet decryptedPages,
         long decryptionBaseOffset
     ) {
         super(resourceDescription);
         this.arena = arena;
         this.segments = segments;
-        this.length = length;
+        this.resourceLength = resourceLength;
         this.chunkSizePower = chunkSizePower;
         this.chunkSizeMask = (1L << chunkSizePower) - 1L;
         this.curSegment = segments[0];
-        this.keyIvResolver = keyIvResolver;
+        this.key = key;
+        this.iv = iv;
         this.decryptedPages = decryptedPages;
         this.resourceDescription = resourceDescription;
         this.decryptionBaseOffset = decryptionBaseOffset;
@@ -123,7 +140,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
     private static void decryptAndProtect(
         String resourceDescription,
-        Arena arena,
+        long resourceLength,
         AtomicBitSet decryptedPages,
         long addr,
         long length,
@@ -161,16 +178,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             }
 
             try {
-                // Handle null arena case (for slices) by creating temporary arena
-                if (arena != null) {
-                    hybridCipher.decryptInPlace(arena, pageAddr, osPageSize, key, iv, pageFileOffset);
-                } else {
-                    // Create temporary arena for slices
-                    try (Arena tempArena = Arena.ofConfined()) {
-                        hybridCipher.decryptInPlace(tempArena, pageAddr, osPageSize, key, iv, pageFileOffset);
-                    }
-                }
-
+                hybridCipher.decryptInPlace(pageAddr, osPageSize, key, iv, pageFileOffset);
                 LOGGER
                     .debug(
                         "Successfully decrypted page: resource={}, pageNum={}, pageAddr=0x{}, pageFileOffset={}",
@@ -217,16 +225,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             long addr = curSegment.address() + curPosition;
             long fileOffset = getDecryptionOffset();
 
-            decryptAndProtect(
-                this.resourceDescription,
-                this.arena,
-                this.decryptedPages,
-                addr,
-                1,
-                fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
-            );
+            decryptAndProtect(this.resourceDescription, this.resourceLength, this.decryptedPages, addr, 1, fileOffset, this.key, this.iv);
 
             final byte v = curSegment.get(LAYOUT_BYTE, curPosition);
             curPosition++;
@@ -248,13 +247,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
                 decryptAndProtect(
                     this.resourceDescription,
-                    this.arena,
+                    this.resourceLength,
                     this.decryptedPages,
                     addr,
                     1,
                     fileOffset,
-                    keyIvResolver.getDataKey().getEncoded(),
-                    keyIvResolver.getIvBytes()
+                    this.key,
+                    this.iv
                 );
 
                 final byte v = curSegment.get(LAYOUT_BYTE, curPosition);
@@ -281,14 +280,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             // Decrypt the entire region we're about to read
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
-
+                this.resourceLength,
                 this.decryptedPages,
                 addr,
                 len,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
+                this.key,
+                this.iv
 
             );
 
@@ -313,14 +311,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
                 long fileOffset = startFileOffset + (originalLen - len); // Calculate relative offset
                 decryptAndProtect(
                     this.resourceDescription,
-                    this.arena,
-
+                    this.resourceLength,
                     this.decryptedPages,
                     addr,
                     curAvail,
                     fileOffset,
-                    keyIvResolver.getDataKey().getEncoded(),
-                    keyIvResolver.getIvBytes()
+                    this.key,
+                    this.iv
 
                 );
                 MemorySegment.copy(curSegment, LAYOUT_BYTE, curPosition, b, offset, (int) curAvail);
@@ -339,13 +336,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             long fileOffset = startFileOffset + (originalLen - len);
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
+                this.resourceLength,
                 this.decryptedPages,
                 addr,
                 len,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
+                this.key,
+                this.iv
 
             );
             MemorySegment.copy(curSegment, LAYOUT_BYTE, curPosition, b, offset, len);
@@ -369,13 +366,14 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             long fileOffset = getDecryptionOffset(); // CHANGE: Use getDecryptionOffset()
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
+                this.resourceLength,
+
                 this.decryptedPages,
                 addr,
                 currentSegmentRemaining,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
+                this.key,
+                this.iv
             );
         }
 
@@ -387,13 +385,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             long fileOffset = decryptionBaseOffset + ((long) (curSegmentIndex + 1) << chunkSizePower);
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
+                this.resourceLength,
                 this.decryptedPages,
                 addr,
                 nextSegment.byteSize(),
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
+                this.key,
+                this.iv
             );
         }
     }
@@ -408,14 +406,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
-
+                this.resourceLength,
                 this.decryptedPages,
                 addr,
                 totalBytes,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
+                this.key,
+                this.iv
 
             );
 
@@ -441,14 +438,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
-
+                this.resourceLength,
                 this.decryptedPages,
                 addr,
                 totalBytes,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
+                this.key,
+                this.iv
 
             );
 
@@ -473,14 +469,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
-
+                this.resourceLength,
                 this.decryptedPages,
                 addr,
                 totalBytes,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
+                this.key,
+                this.iv
 
             );
 
@@ -504,14 +499,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
-
+                this.resourceLength,
                 this.decryptedPages,
                 addr,
                 Short.BYTES,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
+                this.key,
+                this.iv
 
             );
 
@@ -534,14 +528,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
-
+                this.resourceLength,
                 this.decryptedPages,
                 addr,
                 Integer.BYTES,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
+                this.key,
+                this.iv
 
             );
 
@@ -564,14 +557,14 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
+                this.resourceLength,
 
                 this.decryptedPages,
                 addr,
                 Long.BYTES,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
+                this.key,
+                this.iv
 
             );
 
@@ -621,14 +614,14 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             long fileOffset = getDecryptionOffset(pos);
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
+                this.resourceLength,
 
                 this.decryptedPages,
                 addr,
                 1,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
+                this.key,
+                this.iv
 
             );
 
@@ -665,18 +658,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             // Calculate address and decrypt the 2 bytes for short
             long addr = segments[si].address() + segmentOffset;
             long fileOffset = getDecryptionOffset(pos);
-            decryptAndProtect(
-                this.resourceDescription,
-                this.arena,
-
-                this.decryptedPages,
-                addr,
-                2,
-                fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
-
-            );
+            decryptAndProtect(this.resourceDescription, this.resourceLength, this.decryptedPages, addr, 2, fileOffset, this.key, this.iv);
 
             return segments[si].get(LAYOUT_LE_SHORT, segmentOffset);
         } catch (@SuppressWarnings("unused") IndexOutOfBoundsException ioobe) {
@@ -701,15 +683,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
-
+                this.resourceLength,
                 this.decryptedPages,
                 addr,
                 Integer.BYTES,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
-
+                this.key,
+                this.iv
             );
 
             return segments[si].get(LAYOUT_LE_INT, segmentOffset);
@@ -736,15 +716,13 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
             decryptAndProtect(
                 this.resourceDescription,
-                this.arena,
-
+                this.resourceLength,
                 this.decryptedPages,
                 addr,
                 Long.BYTES,
                 fileOffset,
-                keyIvResolver.getDataKey().getEncoded(),
-                keyIvResolver.getIvBytes()
-
+                this.key,
+                this.iv
             );
 
             return segments[si].get(LAYOUT_LE_LONG, segmentOffset);
@@ -761,12 +739,12 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
     @Override
     public final long length() {
-        return length;
+        return resourceLength;
     }
 
     @Override
     public final CryptoMemorySegmentIndexInput clone() {
-        final CryptoMemorySegmentIndexInput clone = buildSlice((String) null, 0L, this.length);
+        final CryptoMemorySegmentIndexInput clone = buildSlice((String) null, 0L, this.resourceLength);
         try {
             clone.seek(getFilePointer());
         } catch (IOException ioe) {
@@ -782,7 +760,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
      */
     @Override
     public final CryptoMemorySegmentIndexInput slice(String sliceDescription, long offset, long length) {
-        if (offset < 0 || length < 0 || offset + length > this.length) {
+        if (offset < 0 || length < 0 || offset + length > this.resourceLength) {
             throw new IllegalArgumentException(
                 "slice() "
                     + sliceDescription
@@ -791,13 +769,11 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
                     + ",length="
                     + length
                     + ",fileLength="
-                    + this.length
+                    + this.resourceLength
                     + ": "
                     + this
             );
         }
-
-        // LOGGER.info("Buliding a slice here {} {} {}", sliceDescription, offset, length);
 
         return buildSlice(sliceDescription, offset, length);
     }
@@ -846,19 +822,21 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
                 slices[0].asSlice(segmentOffset, length),
                 length,
                 chunkSizePower,
-                keyIvResolver,
+                key,
+                iv,
                 this.decryptedPages,
-                sliceAbsoluteOffset  // Pass the absolute file offset
+                sliceAbsoluteOffset  // must pass the absolute file offset
             );
         } else {
             return new MultiSegmentImpl(
                 newResourceDescription,
                 null, // clones don't have an Arena, as they can't close
                 slices,
-                segmentOffset,  // This is the offset within the first segment
+                segmentOffset,  // this is the offset within the first segment
                 length,
                 chunkSizePower,
-                keyIvResolver,
+                key,
+                iv,
                 this.decryptedPages,
                 sliceAbsoluteOffset  // Pass the absolute file offset
             );
@@ -903,7 +881,8 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             MemorySegment segment,
             long length,
             int chunkSizePower,
-            KeyIvResolver keyIvResolver,
+            byte[] key,
+            byte[] iv,
             AtomicBitSet decryptedPages,
             long decryptionBaseOffset
         ) {
@@ -913,7 +892,8 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
                 new MemorySegment[] { segment },
                 length,
                 chunkSizePower,
-                keyIvResolver,
+                key,
+                iv,
                 decryptedPages,
                 decryptionBaseOffset
             );
@@ -924,7 +904,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
         public void seek(long pos) throws IOException {
             ensureOpen();
             try {
-                curPosition = Objects.checkIndex(pos, length + 1);
+                curPosition = Objects.checkIndex(pos, resourceLength + 1);
             } catch (IndexOutOfBoundsException e) {
                 throw handlePositionalIOOBE(e, "seek", pos);
             }
@@ -941,16 +921,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             try {
                 // For single segment, pos is the absolute file position
                 long addr = curSegment.address() + pos;
-                decryptAndProtect(
-                    resourceDescription,
-                    arena,
-                    decryptedPages,
-                    addr,
-                    1,
-                    getDecryptionOffset(pos),
-                    keyIvResolver.getDataKey().getEncoded(),
-                    keyIvResolver.getIvBytes()
-                );
+                decryptAndProtect(resourceDescription, resourceLength, decryptedPages, addr, 1, getDecryptionOffset(pos), key, iv);
 
                 return curSegment.get(LAYOUT_BYTE, pos);
             } catch (IndexOutOfBoundsException e) {
@@ -965,16 +936,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             try {
                 // Decrypt 2 bytes for short
                 long addr = curSegment.address() + pos;
-                decryptAndProtect(
-                    resourceDescription,
-                    arena,
-                    decryptedPages,
-                    addr,
-                    2,
-                    getDecryptionOffset(pos),
-                    keyIvResolver.getDataKey().getEncoded(),
-                    keyIvResolver.getIvBytes()
-                );
+                decryptAndProtect(resourceDescription, resourceLength, decryptedPages, addr, 2, getDecryptionOffset(pos), key, iv);
 
                 return curSegment.get(LAYOUT_LE_SHORT, pos);
             } catch (IndexOutOfBoundsException e) {
@@ -989,16 +951,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             try {
                 // Decrypt 4 bytes for int
                 long addr = curSegment.address() + pos;
-                decryptAndProtect(
-                    resourceDescription,
-                    arena,
-                    decryptedPages,
-                    addr,
-                    4,
-                    getDecryptionOffset(pos),
-                    keyIvResolver.getDataKey().getEncoded(),
-                    keyIvResolver.getIvBytes()
-                );
+                decryptAndProtect(resourceDescription, resourceLength, decryptedPages, addr, 4, getDecryptionOffset(pos), key, iv);
 
                 return curSegment.get(LAYOUT_LE_INT, pos);
             } catch (IndexOutOfBoundsException e) {
@@ -1015,16 +968,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             try {
                 // Decrypt 8 bytes for long
                 long addr = curSegment.address() + pos;
-                decryptAndProtect(
-                    resourceDescription,
-                    arena,
-                    decryptedPages,
-                    addr,
-                    8,
-                    getDecryptionOffset(pos),
-                    keyIvResolver.getDataKey().getEncoded(),
-                    keyIvResolver.getIvBytes()
-                );
+                decryptAndProtect(resourceDescription, resourceLength, decryptedPages, addr, 8, getDecryptionOffset(pos), key, iv);
 
                 return curSegment.get(LAYOUT_LE_LONG, pos);
             } catch (IndexOutOfBoundsException e) {
@@ -1052,11 +996,12 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             long offset,
             long length,
             int chunkSizePower,
-            KeyIvResolver keyIvResolver,
+            byte[] key,
+            byte[] iv,
             AtomicBitSet decryptedPages,
             long decryptionBaseOffset
         ) {
-            super(resourceDescription, arena, segments, length, chunkSizePower, keyIvResolver, decryptedPages, decryptionBaseOffset);
+            super(resourceDescription, arena, segments, length, chunkSizePower, key, iv, decryptedPages, decryptionBaseOffset);
             this.offset = offset;
             try {
                 seek(0L);
