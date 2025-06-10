@@ -47,7 +47,6 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
     final AtomicBitSet decryptedPages;
     final String resourceDescription;
     final long decryptionBaseOffset;
-    private static final HybridCipher hybridCipher = new HybridCipher();
 
     int curSegmentIndex = -1;
     MemorySegment curSegment; // redundant for speed: segments[curSegmentIndex], also marker if closed!
@@ -178,7 +177,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             }
 
             try {
-                hybridCipher.decryptInPlace(pageAddr, osPageSize, key, iv, pageFileOffset);
+                HybridCipher.decryptInPlace(pageAddr, osPageSize, key, iv, pageFileOffset);
                 LOGGER
                     .debug(
                         "Successfully decrypted page: resource={}, pageNum={}, pageAddr=0x{}, pageFileOffset={}",
@@ -367,7 +366,6 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             decryptAndProtect(
                 this.resourceDescription,
                 this.resourceLength,
-
                 this.decryptedPages,
                 addr,
                 currentSegmentRemaining,

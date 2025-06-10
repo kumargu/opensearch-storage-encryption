@@ -6,13 +6,9 @@ package org.opensearch.index.store.cipher;
 
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
-import java.security.NoSuchAlgorithmException;
-import java.security.Provider;
-import java.security.Security;
 import java.util.Arrays;
 
 import javax.crypto.Cipher;
-import javax.crypto.NoSuchPaddingException;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -25,39 +21,22 @@ import javax.crypto.spec.SecretKeySpec;
 @SuppressWarnings("preview")
 public class HybridCipher {
 
-    private final Provider jceProvider;
-    private final ThreadLocal<Cipher> cipherPool;
+    private static final ThreadLocal<Cipher> CIPHER_POOL = ThreadLocal.withInitial(() -> {
+        try {
+            return Cipher.getInstance("AES/CTR/NoPadding", "SunJCE");
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    });
 
-    public HybridCipher() {
-        this.jceProvider = Security.getProvider("SunJCE");
-        this.cipherPool = ThreadLocal.withInitial(() -> {
-            try {
-                return Cipher.getInstance("AES/CTR/NoPadding", jceProvider);
-            } catch (NoSuchAlgorithmException | NoSuchPaddingException e) {
-                throw new RuntimeException("Failed to create cipher", e);
-            }
-        });
+    private HybridCipher() {
+
     }
 
-    /**
-     * Decrypt in-place using the most appropriate method based on size
-     * @throws Throwable 
-     */
-    public void decryptInPlace(long addr, long length, byte[] key, byte[] iv, long fileOffset) throws Throwable {
-        decryptInPlaceViaCipher(addr, (int) length, key, iv, fileOffset);
-    }
-
-    /**
-     * Decrypt small regions using Java Cipher API and ByteBuffer
-     * This avoids JNI overhead for small operations
-     * Uses your proven chunked approach
-     */
-    private void decryptInPlaceViaCipher(long addr, int length, byte[] key, byte[] iv, long fileOffset) throws Exception {
-
+    public static void decryptInPlace(long addr, int length, byte[] key, byte[] iv, long fileOffset) throws Exception {
         // Get thread-local cipher
-        Cipher cipher = cipherPool.get();
+        Cipher cipher = CIPHER_POOL.get();
 
-        // Initialize cipher for this position (your proven approach)
         SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
         byte[] ivCopy = Arrays.copyOf(iv, iv.length);
 
@@ -81,6 +60,51 @@ public class HybridCipher {
 
         // Use your chunked decryption approach
         final int CHUNK_SIZE = Math.min(8192, length); // Smaller chunks for small operations
+        byte[] chunk = new byte[CHUNK_SIZE];
+
+        int position = 0;
+        while (position < buffer.capacity()) {
+            int size = Math.min(CHUNK_SIZE, buffer.capacity() - position);
+            buffer.position(position);
+            buffer.get(chunk, 0, size);
+
+            byte[] decrypted;
+            if (position + size >= buffer.capacity()) {
+                // Last chunk
+                decrypted = cipher.doFinal(chunk, 0, size);
+            } else {
+                decrypted = cipher.update(chunk, 0, size);
+            }
+
+            if (decrypted != null) {
+                buffer.position(position);
+                buffer.put(decrypted);
+            }
+
+            position += size;
+        }
+    }
+
+    public static void decryptSegment(MemorySegment segment, long offset, byte[] key, byte[] iv, int segmentSize) throws Exception {
+        Cipher cipher = CIPHER_POOL.get();
+
+        // Initialize cipher for this position (your proven approach)
+        SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
+        byte[] ivCopy = Arrays.copyOf(iv, iv.length);
+
+        int blockOffset = (int) (offset / CipherFactory.AES_BLOCK_SIZE_BYTES);
+        for (int i = CipherFactory.IV_ARRAY_LENGTH - 1; i >= CipherFactory.IV_ARRAY_LENGTH - CipherFactory.COUNTER_SIZE_BYTES; i--) {
+            ivCopy[i] = (byte) blockOffset;
+            blockOffset >>>= Byte.SIZE;
+        }
+
+        cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(ivCopy));
+
+        // Process the data in smaller chunks to avoid OOM
+        ByteBuffer buffer = segment.asByteBuffer();
+
+        final int CHUNK_SIZE = Math.min(8192, segmentSize);
+
         byte[] chunk = new byte[CHUNK_SIZE];
 
         int position = 0;

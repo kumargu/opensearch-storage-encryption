@@ -50,7 +50,7 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
         this.cryptoMMapDirectoryLargeFilesDelegate = cryptoMMapDirectoryLargeFilesDelegate;
         this.nioExtensions = nioExtensions;
         // Only these files get special treatment
-        this.specialExtensions = Set.of("kdd", "kdi", "kdm", "tip", "tim", "tmd");
+        this.specialExtensions = Set.of("kdd", "kdi", "kdm", "tip", "tim", "tmd", "cfs");
     }
 
     @Override
@@ -107,40 +107,49 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
             return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
         }
 
-        if (fileSize >= (32L << 20)) {
-            LOGGER.info("Routing LARGE files {} to LargeFilesDelegate {}", name, fileSize / 1048576.0);
-            return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
-        }
-
         // Route based on file type and access patterns
         switch (extension) {
-            case "tim", "tip", "tmd" -> {
+            case "tip", "tmd" -> {
                 // Term dictionary files: Random access to small blocks (~2KB)
                 // Always use MMap for optimal performance regardless of size
                 LOGGER.debug("Routing term file {} to MMap for random small block access", name);
                 return delegate.openInput(name, context);
             }
-            case "kdi" -> {
-                // BKD tree index: Random access, typically loaded into heap
-                // Always use MMap for optimal performance
-                LOGGER.debug("Routing KDI {} to MMap for tree traversal", name);
-                return delegate.openInput(name, context);
-            }
-            case "kdm" -> {
+            case "kdm", "kdi" -> {
                 // BKD tree metadata: Small file, infrequent access
                 // Use MMap for simplicity
                 LOGGER.debug("Routing KDM {} to MMap", name);
                 return delegate.openInput(name, context);
             }
 
-            case "kdd" -> {
-                // BKD tree leaf data: Hybrid access pattern
-                // Random access to leaf blocks, sequential within blocks
+            case "tim" -> {
+
+                if (fileSize >= (32L << 20)) {
+                    LOGGER.debug("Routing LARGE files {} for egar {}", name, fileSize / 1048576.0);
+                    return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+                }
+
                 return delegate.openInput(name, context);
             }
 
+            case "kdd" -> {
+
+                if (fileSize >= (32L << 20)) {
+                    LOGGER.debug("Routing LARGE files {} for eagar {}", name, fileSize / 1048576.0);
+                    return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+                }
+
+                return delegate.openInput(name, context);
+
+            }
+
             case "cfs" -> {
-                return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+
+                if ((fileSize >= (2L << 20)) && (fileSize <= (16L << 20))) {
+                    return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+                }
+
+                return delegate.openInput(name, context);
             }
 
             default -> {
