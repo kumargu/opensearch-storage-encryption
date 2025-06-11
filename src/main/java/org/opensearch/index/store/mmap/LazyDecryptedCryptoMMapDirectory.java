@@ -18,12 +18,8 @@ package org.opensearch.index.store.mmap;
 */
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
-import java.lang.foreign.ValueLayout;
-import java.lang.invoke.MethodHandle;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.Provider;
@@ -32,7 +28,6 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
-import java.util.stream.IntStream;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -40,32 +35,15 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.opensearch.common.SuppressForbidden;
-import org.opensearch.index.store.cipher.HybridCipher;
-import org.opensearch.index.store.cipher.OpenSslPanamaCipher;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 @SuppressWarnings("preview")
 @SuppressForbidden(reason = "temporary bypass")
-public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
+public final class LazyDecryptedCryptoMMapDirectory extends MMapDirectory {
 
-    private static final Logger LOGGER = LogManager.getLogger(CryptoMMapDirectory.class);
+    private static final Logger LOGGER = LogManager.getLogger(LazyDecryptedCryptoMMapDirectory.class);
 
     private final KeyIvResolver keyIvResolver;
-
-    private static final Linker LINKER = Linker.nativeLinker();
-    public static final int PROT_READ = 0x1;
-    private static final int PROT_WRITE = 0x2;
-    private static final int MAP_PRIVATE = 0x02;
-    private static final MethodHandle MMAP;
-    private static final MethodHandle MADVISE;
-    public static final MethodHandle MPROTECT;
-    private static final MethodHandle GET_PAGE_SIZE;
-
-    private static final int MADV_NORMAL = 0;
-    private static final int MADV_POPULATE_WRITE = 23;
-    private static final int MADV_WILLNEED = 3;
-
-    private static final SymbolLookup LIBC = loadLibc();
 
     private Function<String, Optional<String>> groupingFunction = GROUP_BY_SEGMENT;
     private final ConcurrentHashMap<String, RefCountedSharedArena> arenas = new ConcurrentHashMap<>();
@@ -93,61 +71,7 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         }
     }
 
-    static {
-        try {
-            // First try to find mmap
-            Optional<MemorySegment> mmapSymbol = LIBC.find("mmap");
-            if (mmapSymbol.isEmpty()) {
-                // If mmap is not found, try mmap64 on some systems
-                mmapSymbol = LIBC.find("mmap64");
-            }
-
-            if (mmapSymbol.isEmpty()) {
-                throw new RuntimeException("Could not find mmap or mmap64 symbol");
-            }
-
-            MMAP = LINKER
-                .downcallHandle(
-                    mmapSymbol.get(),
-                    FunctionDescriptor
-                        .of(
-                            ValueLayout.ADDRESS,
-                            ValueLayout.ADDRESS, // addr
-                            ValueLayout.JAVA_LONG, // length
-                            ValueLayout.JAVA_INT, // prot
-                            ValueLayout.JAVA_INT, // flags
-                            ValueLayout.JAVA_INT, // fd
-                            ValueLayout.JAVA_LONG // offset
-                        )
-                );
-
-            MADVISE = LINKER
-                .downcallHandle(
-                    LIBC.find("madvise").orElseThrow(),
-                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT)
-                );
-
-            MPROTECT = LINKER
-                .downcallHandle(
-                    LIBC.find("mprotect").orElseThrow(),
-                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT)
-                );
-
-            GET_PAGE_SIZE = LINKER.downcallHandle(LIBC.find("getpagesize").orElseThrow(), FunctionDescriptor.of(ValueLayout.JAVA_INT));
-        } catch (Throwable e) {
-            throw new RuntimeException("Failed to load mmap", e);
-        }
-    }
-
-    public static int getPageSize() {
-        try {
-            return (int) GET_PAGE_SIZE.invokeExact();
-        } catch (Throwable e) {
-            return 4096; // fallback to common page size
-        }
-    }
-
-    public CryptoMMapDirectoryLargeFiles(Path path, Provider provider, KeyIvResolver keyIvResolver) throws IOException {
+    public LazyDecryptedCryptoMMapDirectory(Path path, Provider provider, KeyIvResolver keyIvResolver) throws IOException {
         super(path);
         this.keyIvResolver = keyIvResolver;
     }
@@ -177,13 +101,6 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
             }
             return false;
         };
-    }
-
-    public static void madvise(long address, long length, int advice) throws Throwable {
-        int rc = (int) MADVISE.invokeExact(MemorySegment.ofAddress(address), length, advice);
-        if (rc != 0) {
-            throw new RuntimeException("madvise failed with rc=" + rc);
-        }
     }
 
     /**
@@ -276,22 +193,31 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         boolean confined = context == IOContext.READONCE;
         Arena arena = confined ? Arena.ofConfined() : Arena.ofShared();
 
+        // final Arena arena = confined ? Arena.ofConfined() : getSharedArena(name, arenas);
+
         int chunkSizePower = 34;
 
         try {
             // Open the file using native open() call
-            int fd = openFile(file.toString());
+            int fd = PanamaNativeAccess.openFile(file.toString());
             if (fd == -1) {
                 throw new IOException("Failed to open file: " + file);
             }
 
             try {
                 MemorySegment[] segments = mmapAndDecrypt(file, fd, size, arena, chunkSizePower, name, context);
-                return MemorySegmentIndexInput
-                    .newInstance("CryptoMemorySegmentIndexInput(path=\"" + file + "\")", arena, segments, size, chunkSizePower);
+                return LazyDecryptedMemorySegmentIndexInput
+                    .newInstance(
+                        "CryptoMemorySegmentIndexInput(path=\"" + file + "\")",
+                        arena,
+                        segments,
+                        size,
+                        chunkSizePower,
+                        keyIvResolver.getDataKey().getEncoded(),
+                        keyIvResolver.getIvBytes()
+                    );
             } finally {
-                // Close the file descriptor
-                closeFile(fd);
+                PanamaNativeAccess.closeFile(fd);
             }
 
         } catch (Throwable t) {
@@ -306,8 +232,6 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
         final int numSegments = (int) ((size + chunkSize - 1) >>> chunkSizePower);
         MemorySegment[] segments = new MemorySegment[numSegments];
 
-        // Get madvise flags once - they don't change per segment
-        boolean shouldPreload = LuceneIOContextMAdvise.shouldPreload(name, size);
         int madviseFlags = LuceneIOContextMAdvise.getMAdviseFlags(context, name);
 
         long offset = 0;
@@ -315,118 +239,31 @@ public final class CryptoMMapDirectoryLargeFiles extends MMapDirectory {
             long remaining = size - offset;
             long segmentSize = Math.min(chunkSize, remaining);
 
-            MemorySegment mmapSegment = (MemorySegment) MMAP
-                .invoke(MemorySegment.NULL, segmentSize, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, offset);
+            MemorySegment mmapSegment = (MemorySegment) PanamaNativeAccess.MMAP
+                .invoke(
+                    MemorySegment.NULL,
+                    segmentSize,
+                    PanamaNativeAccess.PROT_READ | PanamaNativeAccess.PROT_WRITE,
+                    PanamaNativeAccess.MAP_PRIVATE,
+                    fd,
+                    offset
+                );
             if (mmapSegment.address() == 0 || mmapSegment.address() == -1) {
                 throw new IOException("mmap failed at offset: " + offset);
             }
 
             try {
-                if (mmapSegment.address() % getPageSize() == 0) {
-                    madvise(mmapSegment.address(), segmentSize, MADV_WILLNEED);
-                }
+                PanamaNativeAccess.madvise(mmapSegment.address(), segmentSize, madviseFlags);
             } catch (Throwable t) {
                 LOGGER.warn("madvise failed for {} at context {} advise: {}", name, context, madviseFlags, t);
             }
 
             MemorySegment segment = MemorySegment.ofAddress(mmapSegment.address()).reinterpret(segmentSize, arena, null);
 
-            decryptSegmentInPlaceParallel(arena, segment, offset);
-
             segments[i] = segment;
             offset += segmentSize;
         }
 
         return segments;
-    }
-
-    public void decryptSegmentInPlaceParallel(Arena arena, MemorySegment segment, long segmentOffsetInFile) throws Throwable {
-        final long size = segment.byteSize();
-
-        final int oneMB = 1 << 20; // 1 MiB
-        final int twoMB = 1 << 21; // 2 MiB
-        final int fourMB = 1 << 22; // 4 MiB
-        final int eightMB = 1 << 23; // 8 MiB
-        final int sixteenMB = 1 << 24; // 16 MiB
-
-        final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
-        final byte[] iv = this.keyIvResolver.getIvBytes();
-
-        // Fast-path: no parallelism for ≤ 2 MiB
-        if (size <= (8L << 20)) {
-            HybridCipher.decryptSegment(segment, segmentOffsetInFile, key, iv, (int) size); // downcast is safe.
-
-            return;
-        }
-
-        // Choose adaptive chunk size
-        final int chunkSize;
-        if (size <= (8L << 20)) {
-            chunkSize = twoMB;
-        } else if (size <= (16L << 20)) {
-            chunkSize = fourMB;
-        } else if (size <= (32L << 20)) {
-            chunkSize = fourMB;
-        } else if (size <= (64L << 20)) {
-            chunkSize = eightMB;
-        } else {
-            chunkSize = sixteenMB;
-        }
-
-        final int numChunks = (int) ((size + chunkSize - 1) / chunkSize);
-
-        IntStream.range(0, numChunks).parallel().forEach(i -> {
-            long offset = (long) i * chunkSize;
-            long length = Math.min(chunkSize, size - offset);
-            long fileOffset = segmentOffsetInFile + offset;
-            long addr = segment.address() + offset;
-
-            try {
-                OpenSslPanamaCipher.decryptInPlace(addr, length, key, iv, fileOffset);
-            } catch (Throwable t) {
-                throw new RuntimeException("Decryption failed at offset: " + fileOffset, t);
-            }
-        });
-    }
-
-    private static final MethodHandle OPEN;
-    private static final MethodHandle CLOSE;
-
-    static {
-        try {
-            OPEN = LINKER
-                .downcallHandle(
-                    LIBC.find("open").orElseThrow(),
-                    FunctionDescriptor
-                        .of(
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.ADDRESS, // const char *pathname
-                            ValueLayout.JAVA_INT // int flags
-                        )
-                );
-
-            CLOSE = LINKER
-                .downcallHandle(
-                    LIBC.find("close").orElseThrow(),
-                    FunctionDescriptor
-                        .of(
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.JAVA_INT // int fd
-                        )
-                );
-        } catch (Throwable e) {
-            throw new RuntimeException("Failed to bind open/close", e);
-        }
-    }
-
-    private static int openFile(String path) throws Throwable {
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment pathSegment = arena.allocateUtf8String(path);
-            return (int) OPEN.invoke(pathSegment, 0); // O_RDONLY = 0
-        }
-    }
-
-    private static void closeFile(int fd) throws Throwable {
-        CLOSE.invoke(fd);
     }
 }

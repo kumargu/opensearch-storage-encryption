@@ -13,10 +13,10 @@ import org.apache.lucene.store.BufferedIndexInput;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.SuppressForbidden;
-import org.opensearch.index.store.cipher.OpenSslPanamaCipher;
+import org.opensearch.index.store.cipher.OpenSslNativeCipher;
 
 @SuppressForbidden(reason = "temporary bypass")
-final class CryptoBufferedIndexInputNative extends BufferedIndexInput {
+final class NativeCryptoBufferedIndexInput extends BufferedIndexInput {
 
     private static final int CHUNK_SIZE = 16_384;
 
@@ -29,7 +29,7 @@ final class CryptoBufferedIndexInputNative extends BufferedIndexInput {
 
     private final ByteBuffer tmpBuffer = ByteBuffer.allocate(CHUNK_SIZE);
 
-    public CryptoBufferedIndexInputNative(String resourceDesc, FileChannel fc, IOContext context, byte[] key, byte[] iv)
+    public NativeCryptoBufferedIndexInput(String resourceDesc, FileChannel fc, IOContext context, byte[] key, byte[] iv)
         throws IOException {
         super(resourceDesc, context);
         this.channel = fc;
@@ -40,7 +40,7 @@ final class CryptoBufferedIndexInputNative extends BufferedIndexInput {
         this.isClone = false;
     }
 
-    private CryptoBufferedIndexInputNative(
+    private NativeCryptoBufferedIndexInput(
         String resourceDesc,
         FileChannel fc,
         long off,
@@ -67,9 +67,9 @@ final class CryptoBufferedIndexInputNative extends BufferedIndexInput {
     }
 
     @Override
-    public CryptoBufferedIndexInputNative clone() {
+    public NativeCryptoBufferedIndexInput clone() {
         try {
-            return new CryptoBufferedIndexInputNative(
+            return new NativeCryptoBufferedIndexInput(
                 this.toString(),
                 channel,
                 off + getFilePointer(),
@@ -90,7 +90,7 @@ final class CryptoBufferedIndexInputNative extends BufferedIndexInput {
                 "slice() " + sliceDescription + " out of bounds: offset=" + offset + ", length=" + length + ", fileLength=" + this.length()
             );
         }
-        return new CryptoBufferedIndexInputNative(
+        return new NativeCryptoBufferedIndexInput(
             getFullSliceDescription(sliceDescription),
             channel,
             off + offset,
@@ -119,7 +119,7 @@ final class CryptoBufferedIndexInputNative extends BufferedIndexInput {
         tmpBuffer.get(encrypted, 0, bytesRead);
 
         try {
-            byte[] decrypted = OpenSslPanamaCipher.decrypt(key, iv, encrypted, position);
+            byte[] decrypted = OpenSslNativeCipher.decrypt(key, iv, encrypted, position);
             dst.put(decrypted);
             return decrypted.length;
         } catch (Throwable t) {

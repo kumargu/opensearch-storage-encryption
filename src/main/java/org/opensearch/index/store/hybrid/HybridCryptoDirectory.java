@@ -19,15 +19,15 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.LockFactory;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.store.iv.KeyIvResolver;
-import org.opensearch.index.store.mmap.CryptoMMapDirectory;
-import org.opensearch.index.store.mmap.CryptoMMapDirectoryLargeFiles;
+import org.opensearch.index.store.mmap.EgarDecryptedCryptoMMapDirectory;
+import org.opensearch.index.store.mmap.LazyDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 
 public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
     private static final Logger LOGGER = LogManager.getLogger(CryptoNIOFSDirectory.class);
 
-    private final CryptoMMapDirectory delegate;
-    private final CryptoMMapDirectoryLargeFiles cryptoMMapDirectoryLargeFilesDelegate;
+    private final LazyDecryptedCryptoMMapDirectory lazyDecryptedCryptoMMapDirectoryDelegate;
+    private final EgarDecryptedCryptoMMapDirectory egarDecryptedCryptoMMapDirectory;
     private final Set<String> nioExtensions;
 
     // File size thresholds for special files only
@@ -38,26 +38,23 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
 
     public HybridCryptoDirectory(
         LockFactory lockFactory,
-        CryptoMMapDirectory delegate,
-        CryptoMMapDirectoryLargeFiles cryptoMMapDirectoryLargeFilesDelegate,
+        LazyDecryptedCryptoMMapDirectory delegate,
+        EgarDecryptedCryptoMMapDirectory cryptoMMapDirectoryLargeFilesDelegate,
         Provider provider,
         KeyIvResolver keyIvResolver,
         Set<String> nioExtensions
     )
         throws IOException {
         super(lockFactory, delegate.getDirectory(), provider, keyIvResolver);
-        this.delegate = delegate;
-        this.cryptoMMapDirectoryLargeFilesDelegate = cryptoMMapDirectoryLargeFilesDelegate;
+        this.lazyDecryptedCryptoMMapDirectoryDelegate = delegate;
+        this.egarDecryptedCryptoMMapDirectory = cryptoMMapDirectoryLargeFilesDelegate;
         this.nioExtensions = nioExtensions;
         // Only these files get special treatment
-        this.specialExtensions = Set.of("kdd", "kdi", "kdm", "tip", "tim", "tmd", "cfs");
+        this.specialExtensions = Set.of("kdd", "kdi", "kdm", "tip", "tim", "tmd", "cfs", "doc", "dvd", "nvd", "psm", "fdm");
     }
 
     @Override
     public IndexInput openInput(String name, IOContext context) throws IOException {
-        ensureOpen();
-        ensureCanRead(name);
-
         String extension = FileSwitchDirectory.getExtension(name);
 
         // If not a special extension, always use NIOFS
@@ -65,7 +62,9 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
             return super.openInput(name, context);
         }
 
-        // Special routing for key file types
+        ensureOpen();
+        ensureCanRead(name);
+
         return routeSpecialFile(name, extension, context);
     }
 
@@ -75,7 +74,7 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
 
         // MERGE context: Always use NIOFS for sequential, one-time access
         if (context.context() == Context.MERGE) {
-            LOGGER.info("Routing {} to NIOFS for merge operation", name);
+            LOGGER.debug("Routing {} to NIOFS for merge operation", name);
             return super.openInput(name, context);
         }
 
@@ -96,65 +95,43 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
                 || "kdi".equals(extension)
                 || "kdm".equals(extension)) {
                 LOGGER.debug("Routing {} to MMap during flush for future random access", name);
-                return delegate.openInput(name, context);
+                return lazyDecryptedCryptoMMapDirectoryDelegate.openInput(name, context);
             }
             // Small KDD and CFS files can use MMap during flush
             LOGGER.debug("Routing small {} to MMap during flush", name);
-            return delegate.openInput(name, context);
-        }
-
-        if ((fileSize >= (2L << 20)) && (fileSize <= (8L << 20))) {
-            return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+            return lazyDecryptedCryptoMMapDirectoryDelegate.openInput(name, context);
         }
 
         // Route based on file type and access patterns
         switch (extension) {
-            case "tip", "tmd" -> {
+            case "tmd", "kdm", "kdi", "nvd", "psm", "fdm" -> {
                 // Term dictionary files: Random access to small blocks (~2KB)
                 // Always use MMap for optimal performance regardless of size
                 LOGGER.debug("Routing term file {} to MMap for random small block access", name);
-                return delegate.openInput(name, context);
-            }
-            case "kdm", "kdi" -> {
-                // BKD tree metadata: Small file, infrequent access
-                // Use MMap for simplicity
-                LOGGER.debug("Routing KDM {} to MMap", name);
-                return delegate.openInput(name, context);
+                return egarDecryptedCryptoMMapDirectory.openInput(name, context);
+
             }
 
-            case "tim" -> {
-
-                if (fileSize >= (32L << 20)) {
-                    LOGGER.debug("Routing LARGE files {} for egar {}", name, fileSize / 1048576.0);
-                    return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+            case "tip", "tim", "kdd" -> {
+                if ((fileSize >= (1L << 20)) && (fileSize <= (8L << 20))) {
+                    return egarDecryptedCryptoMMapDirectory.openInput(name, context);
                 }
-
-                return delegate.openInput(name, context);
+                return lazyDecryptedCryptoMMapDirectoryDelegate.openInput(name, context);
             }
 
-            case "kdd" -> {
-
-                if (fileSize >= (32L << 20)) {
-                    LOGGER.debug("Routing LARGE files {} for eagar {}", name, fileSize / 1048576.0);
-                    return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
+            case "doc" -> {
+                if (fileSize <= (8L << 20)) {
+                    return egarDecryptedCryptoMMapDirectory.openInput(name, context);
                 }
-
-                return delegate.openInput(name, context);
-
+                return lazyDecryptedCryptoMMapDirectoryDelegate.openInput(name, context);
             }
 
-            case "cfs" -> {
-
-                if ((fileSize >= (2L << 20)) && (fileSize <= (16L << 20))) {
-                    return cryptoMMapDirectoryLargeFilesDelegate.openInput(name, context);
-                }
-
-                return delegate.openInput(name, context);
+            case "cfs", "dvd" -> {
+                return lazyDecryptedCryptoMMapDirectoryDelegate.openInput(name, context);
             }
 
             default -> {
-                // Should not reach here given our specialExtensions check
-                return super.openInput(name, context);
+                return lazyDecryptedCryptoMMapDirectoryDelegate.openInput(name, context);
             }
         }
     }
@@ -173,10 +150,6 @@ public class HybridCryptoDirectory extends CryptoNIOFSDirectory {
 
     @Override
     public void close() throws IOException {
-        IOUtils.close(super::close, delegate);
-    }
-
-    public CryptoMMapDirectory getDelegate() {
-        return delegate;
+        IOUtils.close(super::close, lazyDecryptedCryptoMMapDirectoryDelegate);
     }
 }

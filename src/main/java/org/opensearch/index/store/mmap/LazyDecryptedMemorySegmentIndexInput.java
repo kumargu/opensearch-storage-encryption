@@ -4,15 +4,15 @@
  */
 package org.opensearch.index.store.mmap;
 
-import static org.opensearch.index.store.mmap.CryptoMMapDirectory.getPageSize;
-
 import java.io.EOFException;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 
 import org.apache.logging.log4j.LogManager;
@@ -22,14 +22,14 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.ArrayUtil;
 import org.opensearch.common.SuppressForbidden;
-import org.opensearch.index.store.cipher.HybridCipher;
+import org.opensearch.index.store.cipher.MemorySegmentDecryptor;
 import org.opensearch.index.store.concurrency.AtomicBitSet;
 
 @SuppressForbidden(reason = "temporary bypass")
 @SuppressWarnings("preview")
-public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomAccessInput {
+public class LazyDecryptedMemorySegmentIndexInput extends IndexInput implements RandomAccessInput {
 
-    private static final Logger LOGGER = LogManager.getLogger(CryptoMemorySegmentIndexInput.class);
+    private static final Logger LOGGER = LogManager.getLogger(LazyDecryptedMemorySegmentIndexInput.class);
 
     static final ValueLayout.OfByte LAYOUT_BYTE = ValueLayout.JAVA_BYTE;
     static final ValueLayout.OfShort LAYOUT_LE_SHORT = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
@@ -52,7 +52,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
     MemorySegment curSegment; // redundant for speed: segments[curSegmentIndex], also marker if closed!
     long curPosition; // relative to curSegment, not globally
 
-    public static CryptoMemorySegmentIndexInput newInstance(
+    public static LazyDecryptedMemorySegmentIndexInput newInstance(
         String resourceDescription,
         Arena arena,
         MemorySegment[] segments,
@@ -62,7 +62,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
         byte[] iv
     ) {
 
-        long totalPages = (resourceLength + getPageSize() - 1) / getPageSize();
+        long totalPages = (resourceLength + PanamaNativeAccess.getPageSize() - 1) / PanamaNativeAccess.getPageSize();
         AtomicBitSet decryptedPages = new AtomicBitSet(totalPages);
 
         assert Arrays.stream(segments).map(MemorySegment::scope).allMatch(arena.scope()::equals);
@@ -96,7 +96,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
     }
 
-    private CryptoMemorySegmentIndexInput(
+    private LazyDecryptedMemorySegmentIndexInput(
         String resourceDescription,
         Arena arena,
         MemorySegment[] segments,
@@ -137,7 +137,8 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
         return pos + decryptionBaseOffset;
     }
 
-    private static void decryptAndProtect(
+    @SuppressWarnings("unused")
+    private static void decryptAndProtectPageByPage(
         String resourceDescription,
         long resourceLength,
         AtomicBitSet decryptedPages,
@@ -147,22 +148,29 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
         byte[] key,
         byte[] iv
     ) throws IOException {
+        // lucene may open zero data files.
+        if (length == 0) {
+            return;
+        }
 
-        int osPageSize = getPageSize();
-
+        int osPageSize = PanamaNativeAccess.getPageSize();
         long alignedAddr = addr & ~(osPageSize - 1);
         long requestEnd = addr + length;
         long alignedEnd = ((requestEnd + osPageSize - 1) & ~(osPageSize - 1));
-
         long baseFileOffset = fileOffset - (addr - alignedAddr);
 
-        for (long pageAddr = alignedAddr; pageAddr < alignedEnd; pageAddr += osPageSize) {
+        int pageCount = 0;
+        int pagesAlreadyDecrypted = 0;
 
+        long startTime = System.nanoTime();
+
+        for (long pageAddr = alignedAddr; pageAddr < alignedEnd; pageAddr += osPageSize) {
             long pageFileOffset = baseFileOffset + (pageAddr - alignedAddr);
             long pageFileKey = pageFileOffset & ~(osPageSize - 1);
             long pageNum = pageFileKey / osPageSize;
 
             if (decryptedPages.getAndSet(pageNum)) {
+                pagesAlreadyDecrypted++;
                 LOGGER.debug("Page already decrypted: resource={}, pageNum={}", resourceDescription, pageNum);
                 continue;
             }
@@ -177,7 +185,9 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             }
 
             try {
-                HybridCipher.decryptInPlace(pageAddr, osPageSize, key, iv, pageFileOffset);
+                MemorySegmentDecryptor.decryptInPlace(pageAddr, osPageSize, key, iv, pageFileOffset);
+                pageCount++;
+
                 LOGGER
                     .debug(
                         "Successfully decrypted page: resource={}, pageNum={}, pageAddr=0x{}, pageFileOffset={}",
@@ -189,7 +199,6 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
 
             } catch (Throwable e) {
                 decryptedPages.clear(pageNum);
-
                 String errorMsg = String
                     .format(
                         "Decryption failed: page=0x%x, pageNum=%d, fileOffset=%d, resource=%s",
@@ -201,6 +210,119 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
                 throw new IOException(errorMsg, e);
             }
         }
+
+        long endTime = System.nanoTime(); //
+        long durationMicros = (endTime - startTime) / 1_000;
+
+        LOGGER
+            .debug(
+                "Lazy decryption {} of cfs files (size: {} MB) slice length {} KB: pages touched {}, pages skipped {}, took {} us",
+                resourceDescription,
+                resourceLength / 1_048_576.0,
+                length,
+                pageCount,
+                pagesAlreadyDecrypted,
+                durationMicros
+            );
+
+    }
+
+    private static void decryptAndProtect(
+        String resourceDescription,
+        long resourceLength,
+        AtomicBitSet decryptedPages,
+        long addr,
+        long length,
+        long fileOffset,
+        byte[] key,
+        byte[] iv
+    ) throws IOException {
+
+        if (length == 0) {
+            return;
+        }
+
+        int osPageSize = PanamaNativeAccess.getPageSize();
+        long alignedAddr = addr & ~(osPageSize - 1);
+        long requestEnd = addr + length;
+        long alignedEnd = ((requestEnd + osPageSize - 1) & ~(osPageSize - 1));
+        long baseFileOffset = fileOffset - (addr - alignedAddr);
+
+        long currentPageAddr = alignedAddr;
+
+        int pageCount = 0;
+        long startTime = System.nanoTime();
+
+        while (currentPageAddr < alignedEnd) {
+            long pageFileOffset = baseFileOffset + (currentPageAddr - alignedAddr);
+            long pageFileKey = pageFileOffset & ~(osPageSize - 1);
+            long pageNum = pageFileKey / osPageSize;
+
+            // Skip if already decrypted
+            if (decryptedPages.getAndSet(pageNum)) {
+                currentPageAddr += osPageSize;
+                continue;
+            }
+
+            // Found an unencrypted page - start collecting contiguous batch
+            long batchStartAddr = currentPageAddr;
+            long batchStartFileOffset = pageFileOffset;
+            List<Long> batchPageNumbers = new ArrayList<>();
+            batchPageNumbers.add(pageNum);
+
+            // Inner while loop: collect all contiguous unencrypted pages
+            currentPageAddr += osPageSize;
+            while (currentPageAddr < alignedEnd) {
+                pageFileOffset = baseFileOffset + (currentPageAddr - alignedAddr);
+                pageFileKey = pageFileOffset & ~(osPageSize - 1);
+                pageNum = pageFileKey / osPageSize;
+
+                // Stop if this page is already decrypted
+                if (decryptedPages.getAndSet(pageNum)) {
+                    break;
+                }
+
+                batchPageNumbers.add(pageNum);
+                currentPageAddr += osPageSize;
+            }
+
+            // Decrypt the entire batch at once
+            long batchSize = batchPageNumbers.size() * osPageSize;
+
+            try {
+                MemorySegmentDecryptor.decryptInPlace(batchStartAddr, batchSize, key, iv, batchStartFileOffset);
+            }
+            // TODO Handle failures for each failed page.
+            catch (Exception e) {
+                // decryptedPages.clear(pageNum);
+                // String errorMsg = String
+                // .format(
+                // "Decryption failed: page=0x%x, pageNum=%d, fileOffset=%d, resource=%s",
+                // pageAddr,
+                // pageNum,
+                // pageFileOffset,
+                // resourceDescription
+                // );
+                throw new IOException(e);
+            }
+
+            pageCount += batchPageNumbers.size();
+
+        }
+
+        long endTime = System.nanoTime(); //
+        long durationMicros = (endTime - startTime) / 1_000;
+
+        LOGGER
+            .debug(
+                "Lazy decryption {} of files (size: {} MB) slice length {} bytes: pages touched {}, took {} us",
+                resourceDescription,
+                resourceLength / 1_048_576.0,
+                length,
+                pageCount,
+                durationMicros
+            );
+
     }
 
     // the unused parameter is just to silence javac about unused variables
@@ -366,6 +488,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
             decryptAndProtect(
                 this.resourceDescription,
                 this.resourceLength,
+
                 this.decryptedPages,
                 addr,
                 currentSegmentRemaining,
@@ -741,8 +864,8 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
     }
 
     @Override
-    public final CryptoMemorySegmentIndexInput clone() {
-        final CryptoMemorySegmentIndexInput clone = buildSlice((String) null, 0L, this.resourceLength);
+    public final LazyDecryptedMemorySegmentIndexInput clone() {
+        final LazyDecryptedMemorySegmentIndexInput clone = buildSlice((String) null, 0L, this.resourceLength);
         try {
             clone.seek(getFilePointer());
         } catch (IOException ioe) {
@@ -757,7 +880,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
      * and length. The slice is seeked to the beginning.
      */
     @Override
-    public final CryptoMemorySegmentIndexInput slice(String sliceDescription, long offset, long length) {
+    public final LazyDecryptedMemorySegmentIndexInput slice(String sliceDescription, long offset, long length) {
         if (offset < 0 || length < 0 || offset + length > this.resourceLength) {
             throw new IllegalArgumentException(
                 "slice() "
@@ -780,7 +903,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
      * Builds the actual sliced IndexInput (may apply extra offset in
      * subclasses). *
      */
-    CryptoMemorySegmentIndexInput buildSlice(String sliceDescription, long offset, long length) {
+    LazyDecryptedMemorySegmentIndexInput buildSlice(String sliceDescription, long offset, long length) {
         ensureOpen();
 
         // Calculate the absolute file position where this slice starts
@@ -871,7 +994,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
      * Optimization of MemorySegmentIndexInput for when there is only one
      * segment.
      */
-    static final class SingleSegmentImpl extends CryptoMemorySegmentIndexInput {
+    static final class SingleSegmentImpl extends LazyDecryptedMemorySegmentIndexInput {
 
         SingleSegmentImpl(
             String resourceDescription,
@@ -983,7 +1106,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
      * This class adds offset support to MemorySegmentIndexInput, which is
      * needed for slices.
      */
-    static final class MultiSegmentImpl extends CryptoMemorySegmentIndexInput {
+    static final class MultiSegmentImpl extends LazyDecryptedMemorySegmentIndexInput {
 
         private final long offset;
 
@@ -1046,7 +1169,7 @@ public class CryptoMemorySegmentIndexInput extends IndexInput implements RandomA
         }
 
         @Override
-        CryptoMemorySegmentIndexInput buildSlice(String sliceDescription, long ofs, long length) {
+        LazyDecryptedMemorySegmentIndexInput buildSlice(String sliceDescription, long ofs, long length) {
             return super.buildSlice(sliceDescription, this.offset + ofs, length);
         }
 

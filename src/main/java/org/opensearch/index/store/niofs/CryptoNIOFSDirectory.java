@@ -21,7 +21,7 @@ import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.LockFactory;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.common.util.io.IOUtils;
-import org.opensearch.index.store.cipher.CipherFactory;
+import org.opensearch.index.store.cipher.AesCipherFactory;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 /**
@@ -54,8 +54,8 @@ public class CryptoNIOFSDirectory extends NIOFSDirectory {
         boolean success = false;
 
         try {
-            Cipher cipher = CipherFactory.getCipher(provider);
-            CipherFactory.initCipher(cipher, keyIvResolver.getDataKey(), keyIvResolver.getIvBytes(), Cipher.DECRYPT_MODE, 0);
+            Cipher cipher = AesCipherFactory.getCipher(provider);
+            AesCipherFactory.initCipher(cipher, keyIvResolver.getDataKey(), keyIvResolver.getIvBytes(), Cipher.DECRYPT_MODE, 0);
 
             final IndexInput indexInput = new CryptoBufferedIndexInput(
                 "CryptoBufferedIndexInput(path=\"" + path + "\")",
@@ -86,7 +86,7 @@ public class CryptoNIOFSDirectory extends NIOFSDirectory {
         // Cipher cipher = CipherFactory.getCipher(provider);
         // CipherFactory.initCipher(cipher, this.keyIvResolver.getDataKey(), keyIvResolver.getIvBytes(), Cipher.ENCRYPT_MODE, 0);
 
-        return new CryptoOutputStreamIndexOutputNative(
+        return new NativeCryptoOutputStreamIndexOutput(
             name,
             path,
             fos,
@@ -110,7 +110,7 @@ public class CryptoNIOFSDirectory extends NIOFSDirectory {
 
         // CipherFactory.initCipher(cipher, keyIvResolver.getDataKey(), keyIvResolver.getIvBytes(), Cipher.ENCRYPT_MODE, 0);
 
-        return new CryptoOutputStreamIndexOutputNative(
+        return new NativeCryptoOutputStreamIndexOutput(
             name,
             path,
             fos,

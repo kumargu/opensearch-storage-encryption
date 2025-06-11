@@ -11,16 +11,15 @@ import java.nio.file.Path;
 
 import org.apache.lucene.store.OutputStreamIndexOutput;
 import org.opensearch.common.SuppressForbidden;
-import org.opensearch.index.store.cipher.OpenSslPanamaCipher;
+import org.opensearch.index.store.cipher.OpenSslNativeCipher;
 
 /**
  * An IndexOutput implementation that encrypts data before writing using native OpenSSL AES-CTR.
  *
  * @opensearch.internal
  */
-@SuppressWarnings("preview")
 @SuppressForbidden(reason = "temporary bypass")
-public final class CryptoOutputStreamIndexOutputNative extends OutputStreamIndexOutput {
+public final class NativeCryptoOutputStreamIndexOutput extends OutputStreamIndexOutput {
 
     static final int CHUNK_SIZE = 8192;
 
@@ -35,12 +34,10 @@ public final class CryptoOutputStreamIndexOutputNative extends OutputStreamIndex
      * @throws IOException If there is an I/O error
      * @throws IllegalArgumentException If key or iv lengths are invalid
      */
-    public CryptoOutputStreamIndexOutputNative(String name, Path path, OutputStream os, byte[] key, byte[] iv) throws IOException {
+    public NativeCryptoOutputStreamIndexOutput(String name, Path path, OutputStream os, byte[] key, byte[] iv) throws IOException {
         super("FSIndexOutput(path=\"" + path + "\")", name, new EncryptedOutputStream(os, key, iv), CHUNK_SIZE);
     }
 
-    @SuppressWarnings("preview")
-    @SuppressForbidden(reason = "temporary bypass")
     private static class EncryptedOutputStream extends FilterOutputStream {
         private static final int BUFFER_SIZE = 65536;
 
@@ -101,7 +98,7 @@ public final class CryptoOutputStreamIndexOutputNative extends OutputStreamIndex
 
         private void processAndWrite(byte[] data, int offset, int length) throws IOException {
             try {
-                byte[] encrypted = OpenSslPanamaCipher.encrypt(key, iv, slice(data, offset, length), streamOffset);
+                byte[] encrypted = OpenSslNativeCipher.encrypt(key, iv, slice(data, offset, length), streamOffset);
                 out.write(encrypted);
                 streamOffset += length;
             } catch (Throwable t) {

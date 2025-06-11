@@ -18,7 +18,7 @@ import org.apache.lucene.store.BufferedIndexInput;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.SuppressForbidden;
-import org.opensearch.index.store.cipher.CipherFactory;
+import org.opensearch.index.store.cipher.AesCipherFactory;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 /**
@@ -67,8 +67,8 @@ final class CryptoBufferedIndexInput extends BufferedIndexInput {
         this.isClone = true;
         this.keyResolver = keyResolver;
 
-        this.cipher = CipherFactory.getCipher(originalCipher.getProvider());
-        CipherFactory.initCipher(cipher, keyResolver.getDataKey(), keyResolver.getIvBytes(), Cipher.DECRYPT_MODE, off);
+        this.cipher = AesCipherFactory.getCipher(originalCipher.getProvider());
+        AesCipherFactory.initCipher(cipher, keyResolver.getDataKey(), keyResolver.getIvBytes(), Cipher.DECRYPT_MODE, off);
     }
 
     @Override
@@ -82,8 +82,8 @@ final class CryptoBufferedIndexInput extends BufferedIndexInput {
     public CryptoBufferedIndexInput clone() {
         CryptoBufferedIndexInput clone = (CryptoBufferedIndexInput) super.clone();
         clone.tmpBuffer = ByteBuffer.allocate(CHUNK_SIZE);
-        clone.cipher = CipherFactory.getCipher(cipher.getProvider());
-        CipherFactory
+        clone.cipher = AesCipherFactory.getCipher(cipher.getProvider());
+        AesCipherFactory
             .initCipher(clone.cipher, keyResolver.getDataKey(), keyResolver.getIvBytes(), Cipher.DECRYPT_MODE, getFilePointer() + off);
         return clone;
     }
@@ -155,6 +155,6 @@ final class CryptoBufferedIndexInput extends BufferedIndexInput {
         if (pos > length()) {
             throw new EOFException("seek past EOF: pos=" + pos + ", length=" + length());
         }
-        CipherFactory.initCipher(cipher, keyResolver.getDataKey(), keyResolver.getIvBytes(), Cipher.DECRYPT_MODE, pos + off);
+        AesCipherFactory.initCipher(cipher, keyResolver.getDataKey(), keyResolver.getIvBytes(), Cipher.DECRYPT_MODE, pos + off);
     }
 }

@@ -28,14 +28,13 @@ import org.opensearch.common.SuppressForbidden;
  */
 @SuppressForbidden(reason = "temporary bypass")
 @SuppressWarnings("preview")
-public final class OpenSslPanamaCipher {
+public final class OpenSslNativeCipher {
 
-    private static final Logger LOGGER = LogManager.getLogger(OpenSslPanamaCipher.class);
+    private static final Logger LOGGER = LogManager.getLogger(OpenSslNativeCipher.class);
 
     public static final int AES_BLOCK_SIZE = 16;
     public static final int AES_256_KEY_SIZE = 32;
-
-    public static final int COUNTER_SIZE_BYTES = 4;
+    public static final int COUNTER_SIZE = 4;
 
     public static final MethodHandle EVP_CIPHER_CTX_new;
     public static final MethodHandle EVP_CIPHER_CTX_free;
@@ -83,7 +82,7 @@ public final class OpenSslPanamaCipher {
                 }
 
                 throw new RuntimeException("Could not find libcrypto in known Linux paths.");
-            } catch (Exception e) {
+            } catch (RuntimeException e) {
                 throw new RuntimeException("Failed to load libcrypto", e);
             }
         } else {
@@ -149,9 +148,6 @@ public final class OpenSslPanamaCipher {
     }
 
     public static byte[] computeOffsetIV(byte[] baseIV, long filePosition) {
-        final int AES_BLOCK_SIZE = 16;
-        final int COUNTER_SIZE = 4;
-
         byte[] ivCopy = Arrays.copyOf(baseIV, AES_BLOCK_SIZE);
 
         int counter = (int) (filePosition / AES_BLOCK_SIZE);
@@ -382,12 +378,10 @@ public final class OpenSslPanamaCipher {
 
                 int partialBlockOffset = (int) (fileOffset % AES_BLOCK_SIZE);
                 if (partialBlockOffset > 0) {
-                    long tDummyStart = System.nanoTime();
                     MemorySegment dummyIn = arena.allocateArray(ValueLayout.JAVA_BYTE, partialBlockOffset);
                     MemorySegment dummyOut = arena.allocate(partialBlockOffset + AES_BLOCK_SIZE);
                     MemorySegment dummyLen = arena.allocate(ValueLayout.JAVA_INT);
                     EVP_EncryptUpdate.invoke(ctx, dummyOut, dummyLen, dummyIn, partialBlockOffset);
-                    long tDummyEnd = System.nanoTime();
                 }
 
                 MemorySegment inOut = MemorySegment.ofAddress(addr).reinterpret(length);
@@ -402,24 +396,25 @@ public final class OpenSslPanamaCipher {
 
                 // Final log
                 long tEnd = System.nanoTime();
-                // LOGGER
-                // .info(
-                // "Decryption breakdown ({} MiB at offset {}):\n"
-                // + " > ctx alloc: {} µs\n"
-                // + " > cipher lookup: {} µs\n"
-                // + " > key/iv alloc: {} µs\n"
-                // + " > init cipher: {} µs\n"
-                // + " > update decrypt: {} µs\n"
-                // + " > total time: {} µs",
-                // String.format("%.2f", length / 1048576.0),
-                // fileOffset,
-                // (tCtxAlloc - tCtxStart) / 1_000,
-                // (tCipherLookup - tCipherStart) / 1_000,
-                // (tKeyIvAlloc - tKeyIvStart) / 1_000,
-                // (tInit - tKeyIvAlloc) / 1_000,
-                // (tUpdateEnd - tUpdateStart) / 1_000,
-                // (tEnd - tStart) / 1_000
-                // );
+                LOGGER
+                    .trace(
+                        """
+                            Decryption breakdown ({} MiB at offset {}):
+                             > ctx alloc: {} \u00b5s
+                             > cipher lookup: {} \u00b5s
+                             > key/iv alloc: {} \u00b5s
+                             > init cipher: {} \u00b5s
+                             > update decrypt: {} \u00b5s
+                             > total time: {} \u00b5s""",
+                        String.format("%.2f", length / 1048576.0),
+                        fileOffset,
+                        (tCtxAlloc - tCtxStart) / 1_000,
+                        (tCipherLookup - tCipherStart) / 1_000,
+                        (tKeyIvAlloc - tKeyIvStart) / 1_000,
+                        (tInit - tKeyIvAlloc) / 1_000,
+                        (tUpdateEnd - tUpdateStart) / 1_000,
+                        (tEnd - tStart) / 1_000
+                    );
 
             } finally {
                 EVP_CIPHER_CTX_free.invoke(ctx);
@@ -470,7 +465,7 @@ public final class OpenSslPanamaCipher {
         }
     }
 
-    private OpenSslPanamaCipher() {
+    private OpenSslNativeCipher() {
         // Utility class
     }
 }
