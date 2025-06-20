@@ -16,12 +16,6 @@ import javax.crypto.NoSuchPaddingException;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
-/**
- * Hybrid cipher implementation that can use either:
- * 1. Native OpenSSL via Panama (for large operations)
- * 2. Java Cipher API via ByteBuffer (for small operations, better JIT optimization)
- */
-
 @SuppressWarnings("preview")
 public class MemorySegmentDecryptor {
 
