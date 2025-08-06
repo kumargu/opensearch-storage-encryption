@@ -15,6 +15,11 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -180,40 +185,6 @@ public class CryptoDirectIOMemoryIndexInput extends IndexInput implements Random
         return new AlreadyClosedException("Already closed: " + this);
     }
 
-    private void fillBlockCacheForRange(long fileOffset, long lengthNeeded) throws IOException {
-        if (lengthNeeded == 0)
-            return;
-
-        long alignedBlockStart = fileOffset & ~CACHE_BLOCK_MASK;
-        long requestEnd = fileOffset + lengthNeeded;
-        long alignedBlockEnd = ((requestEnd + CACHE_BLOCK_SIZE - 1) & ~CACHE_BLOCK_MASK);
-
-        int blocksProcessed = 0;
-        long startTime = System.nanoTime();
-
-        for (long blockOffset = alignedBlockStart; blockOffset < alignedBlockEnd; blockOffset += CACHE_BLOCK_SIZE) {
-            DirectIOBlockCacheKey cacheKey = new DirectIOBlockCacheKey(path, blockOffset);
-
-            try {
-                blockCache.getOrLoad(cacheKey, CACHE_BLOCK_SIZE, blockLoader);
-                blocksProcessed++;
-            } catch (IOException e) {
-                LOGGER.error("Failed to access cache for block at offset {}: {}", blockOffset, e);
-            }
-        }
-
-        long durationMicros = (System.nanoTime() - startTime) / 1_000;
-        LOGGER
-            .info(
-                "Cache fill for {} (offset={}, length={}): blocks={}, took={} us",
-                path.getFileName(),
-                fileOffset,
-                lengthNeeded,
-                blocksProcessed,
-                durationMicros
-            );
-    }
-
     // for positioning/seeking (no data needed)
     protected MemorySegment loadSegment(int segmentIndex) throws IOException {
         ensureOpen();
@@ -221,32 +192,63 @@ public class CryptoDirectIOMemoryIndexInput extends IndexInput implements Random
         return segments[segmentIndex];
     }
 
+    private static final int PREFETCH_BLOCKS = 4;
+    private static final ExecutorService prefetchExecutor = Executors
+        .newFixedThreadPool(Math.max(4, Runtime.getRuntime().availableProcessors() / 2));
+
+    private final Set<Long> inflightPrefetches = ConcurrentHashMap.newKeySet();
+
+    private void triggerAsyncPrefetch(long startBlockOffset) {
+        if (!inflightPrefetches.add(startBlockOffset)) {
+            return; // Already inflight
+        }
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                for (int i = 0; i < PREFETCH_BLOCKS; i++) {
+                    long offset = startBlockOffset + (long) i * CACHE_BLOCK_SIZE;
+                    if (offset >= absoluteBaseOffset + length)
+                        break;
+
+                    DirectIOBlockCacheKey cacheKey = new DirectIOBlockCacheKey(path, offset);
+                    blockCache.getOrLoad(cacheKey, CACHE_BLOCK_SIZE, blockLoader);
+
+                }
+            } catch (Exception e) {
+                LOGGER.debug("Prefetch failed at start {}: {}", startBlockOffset, e.getMessage());
+            } finally {
+                inflightPrefetches.remove(startBlockOffset);
+            }
+        }, prefetchExecutor);
+    }
+
     protected MemorySegment loadSegment(int segmentIndex, long fileOffset, int lengthNeeded) throws IOException {
         ensureOpen();
 
         if (lengthNeeded < CACHE_BLOCK_SIZE) {
-            // Small read - always use mmap
             return segments[segmentIndex];
         } else {
-            // Check if this segment was already upgraded to cached version
             if (refSegments[segmentIndex] != null) {
-                // Already cached - no lookup needed!
                 return segments[segmentIndex];
             }
 
-            // Large read - cache-first strategy
             if (blockCache != null) {
                 long alignedBlockStart = fileOffset & ~CACHE_BLOCK_MASK;
                 DirectIOBlockCacheKey cacheKey = new DirectIOBlockCacheKey(path, alignedBlockStart);
-
                 Optional<BlockCacheValue<RefCountedMemorySegment>> cached = blockCache.get(cacheKey);
 
                 if (cached.isPresent()) {
                     RefCountedMemorySegment refSeg = cached.get().block();
                     segments[segmentIndex] = refSeg.segment();
-                    refSegments[segmentIndex] = refSeg;  // Mark as upgraded
+                    refSegments[segmentIndex] = refSeg;
+
+                    // Prefetch NEXT blocks for upcoming reads
+                    triggerAsyncPrefetch(alignedBlockStart + CACHE_BLOCK_SIZE);
 
                     return segments[segmentIndex];
+                } else {
+                    // Cache miss - current block will use mmap, but prefetch next blocks
+                    triggerAsyncPrefetch(alignedBlockStart + CACHE_BLOCK_SIZE);
                 }
             }
 
