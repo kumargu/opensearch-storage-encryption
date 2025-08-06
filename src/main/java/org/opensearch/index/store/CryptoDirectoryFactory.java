@@ -4,10 +4,6 @@
  */
 package org.opensearch.index.store;
 
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
-import static org.opensearch.index.store.directio.DirectIoConfigs.RESEVERED_POOL_SIZE_IN_BYTES;
-import static org.opensearch.index.store.directio.DirectIoConfigs.WARM_UP_PERCENTAGE;
-
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Files;
@@ -45,12 +41,19 @@ import org.opensearch.index.store.block_cache.Pool;
 import org.opensearch.index.store.block_cache.RefCountedMemorySegment;
 import org.opensearch.index.store.directio.CryptoDirectIODirectory;
 import org.opensearch.index.store.directio.CryptoDirectIOSegmentBlockLoader;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
+import static org.opensearch.index.store.directio.DirectIoConfigs.RESEVERED_POOL_SIZE_IN_BYTES;
+import static org.opensearch.index.store.directio.DirectIoConfigs.WARM_UP_PERCENTAGE;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
 import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.store.mmap.EagerDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.mmap.LazyDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
+import org.opensearch.index.store.read_ahead.ReadAheadManager;
+import org.opensearch.index.store.read_ahead.Worker;
+import org.opensearch.index.store.read_ahead.impl.QueuingWorker;
+import org.opensearch.index.store.read_ahead.impl.ReadaheadManagerImpl;
 import org.opensearch.plugins.IndexStorePlugin;
 
 import com.github.benmanes.caffeine.cache.Cache;
@@ -231,7 +234,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         *     → Its associated segment is not released immediately if refCount > 1.
         *     → Only when all holders release the segment (refCount → 0), the memory is returned.
         *
-        * Subtle Implication:
+        * Implication:
         * --------------------
         * - This design decouples **cache visibility** from **memory lifetime**.
         *   Even if a segment is evicted from cache, it may continue to live
@@ -268,8 +271,22 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
         BlockCache<RefCountedMemorySegment> blockCache = new CaffeineBlockCache<>(cache, loader, 16384);
 
-        return new CryptoDirectIODirectory(location, lockFactory, provider, keyIvResolver, sharedSegmentPool, blockCache, loader);
+        // Initialize ReadAhead
+        int queueCapacity = 100;
+        int threads = Math.max(4, Runtime.getRuntime().availableProcessors() / 4);
+        Worker readaheadWorker = new QueuingWorker(queueCapacity, threads, blockCache, loader, (int) CACHE_BLOCK_SIZE);
+        ReadAheadManager readAheadManager = new ReadaheadManagerImpl(readaheadWorker);
 
+        return new CryptoDirectIODirectory(
+            location,
+            lockFactory,
+            provider,
+            keyIvResolver,
+            sharedSegmentPool,
+            blockCache,
+            loader,
+            readAheadManager
+        );
     }
 
     private void ensureSharedPoolInitialized() {

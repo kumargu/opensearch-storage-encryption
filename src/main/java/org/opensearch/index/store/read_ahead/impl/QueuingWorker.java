@@ -21,7 +21,7 @@ import org.opensearch.index.store.block_cache.BlockCacheKey;
 import org.opensearch.index.store.block_cache.BlockLoader;
 import org.opensearch.index.store.block_cache.RefCountedMemorySegment;
 import org.opensearch.index.store.directio.DirectIOBlockCacheKey;
-import org.opensearch.index.store.read_ahead.ReadaheadWorker;
+import org.opensearch.index.store.read_ahead.Worker;
 
 /**
  * Async background worker for block readahead.
@@ -30,14 +30,14 @@ import org.opensearch.index.store.read_ahead.ReadaheadWorker;
  * - Uses a queue to offload I/O to background threads
  * - Delegates caching logic to BlockCache.getOrLoad()
  */
-public class AsyncReadaheadWorker implements ReadaheadWorker {
+public class QueuingWorker implements Worker {
 
-    private static final Logger LOGGER = LogManager.getLogger(AsyncReadaheadWorker.class);
+    private static final Logger LOGGER = LogManager.getLogger(QueuingWorker.class);
 
-    private record ReadaheadTask(BlockCacheKey key, int length) {
+    private record ReadAheadTask(BlockCacheKey key, int length) {
     }
 
-    private final BlockingQueue<ReadaheadTask> queue;
+    private final BlockingQueue<ReadAheadTask> queue;
     private final Set<BlockCacheKey> inFlight;
     private final ExecutorService executor;
 
@@ -53,7 +53,7 @@ public class AsyncReadaheadWorker implements ReadaheadWorker {
      * @param blockLoader   loader used by blockCache.getOrLoad()
      * @param segmentSize   block/segment size
      */
-    public AsyncReadaheadWorker(
+    public QueuingWorker(
         int queueCapacity,
         int threads,
         BlockCache<RefCountedMemorySegment> blockCache,
@@ -95,7 +95,7 @@ public class AsyncReadaheadWorker implements ReadaheadWorker {
             return true; // already scheduled
         }
 
-        ReadaheadTask task = new ReadaheadTask(key, length);
+        ReadAheadTask task = new ReadAheadTask(key, length);
 
         // Non-blocking enqueue
         if (queue.offer(task)) {
@@ -114,13 +114,13 @@ public class AsyncReadaheadWorker implements ReadaheadWorker {
     private void processLoop() {
         while (!closed) {
             try {
-                ReadaheadTask task = queue.poll(100, TimeUnit.MILLISECONDS);
+                ReadAheadTask task = queue.poll(100, TimeUnit.MILLISECONDS);
                 if (task == null) {
                     continue;
                 }
 
+                // acquires a segment from pool and loads to cache.
                 try {
-                    // Prefetch into block cache if not already loaded
                     blockCache.getOrLoad(task.key(), task.length(), blockLoader);
                 } catch (IOException e) {
                     LOGGER.warn("Failed to prefetch segment offset={} path={}", task.key().offset(), task.key().filePath(), e);

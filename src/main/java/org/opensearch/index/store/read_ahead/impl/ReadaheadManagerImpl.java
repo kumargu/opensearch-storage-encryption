@@ -5,65 +5,61 @@
 package org.opensearch.index.store.read_ahead.impl;
 
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.index.store.read_ahead.ReadaheadContext;
-import org.opensearch.index.store.read_ahead.ReadaheadManager;
-import org.opensearch.index.store.read_ahead.ReadaheadWorker;
+import org.opensearch.index.store.read_ahead.ReadAheadContext;
+import org.opensearch.index.store.read_ahead.ReadAheadManager;
+import org.opensearch.index.store.read_ahead.Worker;
 
 /**
- * Simplified ReadaheadManager for single IndexInput.
+ * ReadaheadManager for single IndexInput.
  *
- * - Holds a single ReadaheadContext for the lifetime of the IndexInput.
- * - Delegates scheduling to a ReadaheadWorker.
+ * - Holds a single ReadAheadContext for the lifetime of the IndexInput.
+ * - Delegates scheduling to a ReadAheadWorker.
  * - No registry map needed because lifetime is tied to IndexInput.
  */
-public class ReadaheadManagerImpl implements ReadaheadManager {
+public class ReadaheadManagerImpl implements ReadAheadManager {
 
     private static final Logger LOGGER = LogManager.getLogger(ReadaheadManagerImpl.class);
 
-    private final ReadaheadWorker worker;
-    private volatile boolean closed = false;
-    private ReadaheadContext context;
+    private final Worker worker;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+    private ReadAheadContext context;
 
-    public ReadaheadManagerImpl(ReadaheadWorker worker) {
+    public ReadaheadManagerImpl(Worker worker) {
         this.worker = worker;
     }
 
     @Override
-    public ReadaheadContext register(Path path, int segmentSize, int segmentSizePower, long fileLength) {
-        if (closed) {
+    public ReadAheadContext register(Path path, long fileLength) {
+        if (closed.get()) {
             throw new IllegalStateException("ReadaheadManager is closed");
         }
 
-        AdaptiveReadaheadConfig config = new AdaptiveReadaheadConfig.Builder()
+        WindowedReadAheadConfig config = new WindowedReadAheadConfig.Builder()
             .initialWindow(1)
             .maxWindowSegments(8)
             .hitStreakThreshold(5)
             .shrinkOnRandomThreshold(3)
             .build();
 
-        this.context = AdaptiveReadaheadContext.build(path, segmentSize, segmentSizePower, fileLength, worker, config);
+        this.context = WindowedReadAheadContext.build(path, fileLength, worker, config);
 
-        LOGGER.debug("Registered readahead context for {}", path);
         return this.context;
     }
 
     @Override
-    public void onSegmentAccess(ReadaheadContext ctx, int segmentIndex, boolean cacheMiss) {
-        if (closed || ctx == null)
+    public void onSegmentAccess(ReadAheadContext ctx, long startFileOffset, boolean cacheMiss) {
+        if (closed.get() || ctx == null) {
             return;
-        AdaptiveReadaheadContext arc = (AdaptiveReadaheadContext) ctx;
-
-        // Compute byte offset using shift (segmentIndex * segmentSize)
-        long fileOffset = ((long) segmentIndex) << arc.segmentSizePower();
-
-        arc.onSegmentAccess(fileOffset, cacheMiss);
+        }
+        ctx.onSegmentAccess(startFileOffset, cacheMiss);
     }
 
     @Override
-    public void cancel(ReadaheadContext ctx) {
+    public void cancel(ReadAheadContext ctx) {
         if (ctx != null) {
             ctx.close();
             LOGGER.debug("Cancelled readahead for context {}", ctx);
@@ -80,8 +76,15 @@ public class ReadaheadManagerImpl implements ReadaheadManager {
 
     @Override
     public void close() {
-        try (worker) {
-            closed = true;
+        if (closed.compareAndSet(false, true)) {
+            try {
+                if (worker != null) {
+                    worker.close();
+                }
+            } catch (Exception e) {
+                LOGGER.warn("Error closing readahead worker", e);
+            }
+
             try {
                 if (context != null) {
                     context.close();

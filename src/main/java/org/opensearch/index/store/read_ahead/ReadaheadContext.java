@@ -34,7 +34,7 @@ import java.io.Closeable;
  *
  */
 
-public interface ReadaheadContext extends Closeable {
+public interface ReadAheadContext extends Closeable {
 
     /**
      * Called on each segment load to update access pattern and possibly trigger readahead.
@@ -45,16 +45,11 @@ public interface ReadaheadContext extends Closeable {
     void onSegmentAccess(long fileOffset, boolean cacheMiss);
 
     /**
-     * @return the current adaptive readahead window size (in segments)
-     */
-    int currentWindowSegments();
-
-    /**
      * Trigger a readahead for the next window of segments.
      *
      * @param startSegmentIndex first segment index to prefetch
      */
-    void triggerReadahead(int startSegmentIndex);
+    void triggerReadahead(long startSegmentIndex);
 
     /**
      * Reset the readahead state (e.g., after a large random seek or stream reset).
@@ -69,7 +64,7 @@ public interface ReadaheadContext extends Closeable {
     /**
      * @return true if readahead is currently enabled (based on cache misses and policy)
      */
-    boolean isReadaheadEnabled();
+    boolean isReadAheadEnabled();
 
     @Override
     void close();

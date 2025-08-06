@@ -12,14 +12,14 @@ import java.nio.file.Path;
  * <p>
  * Coordinates:
  * <ul>
- *     <li>Per-stream {@link ReadaheadContext}</li>
+ *     <li>Per-stream {@link ReadAheadContext}</li>
  *     <li>Adaptive windowing policy</li>
- *     <li>Async scheduling to a {@link ReadaheadWorker}</li>
+ *     <li>Async scheduling to a {@link Worker}</li>
  * </ul>
  *
  * Typical flow:
  * <pre>
- *   ReadaheadContext ctx = manager.register(path, segmentSize);
+ *   ReadAheadContext ctx = manager.register(path, offset);
  *
  *   // on each segment load in IndexInput:
  *   manager.onSegmentAccess(ctx, segmentIndex, cacheMiss);
@@ -28,25 +28,25 @@ import java.nio.file.Path;
  *   manager.cancel(ctx);
  * </pre>
  */
-public interface ReadaheadManager extends Closeable {
+public interface ReadAheadManager extends Closeable {
 
-    ReadaheadContext register(Path path, int segmentSize, int segmentSizePower, long fileLength);
+    ReadAheadContext register(Path path, long fileLength);
 
     /**
      * Notify that a segment was accessed, possibly triggering readahead.
      *
      * @param context       per-index input context
-     * @param segmentIndex  the segment index that was accessed
+     * @param startFileOffset  the fileoffset from where we start reading.
      * @param cacheMiss     true if the block was not in cache (enables RA)
      */
-    void onSegmentAccess(ReadaheadContext context, int segmentIndex, boolean cacheMiss);
+    void onSegmentAccess(ReadAheadContext context, long startFileOffset, boolean cacheMiss);
 
     /**
      * Cancel all readahead for a given stream context.
      *
      * @param context the readahead context to cancel
      */
-    void cancel(ReadaheadContext context);
+    void cancel(ReadAheadContext context);
 
     /**
      * Cancel all pending requests for a given file.

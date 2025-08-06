@@ -9,7 +9,7 @@ import java.nio.file.Path;
 /**
  * A single block prefetch request for async readahead.
  */
-public interface ReadaheadRequest {
+public interface ReadAheadRequest {
 
     /**
      * @return the file path to read from

@@ -7,16 +7,15 @@ package org.opensearch.index.store.read_ahead;
 /**
  * Defines how readahead should behave depending on access pattern.
  */
-public interface ReadaheadPolicy {
+public interface ReadAheadPolicy {
 
     /**
      * Called on every segment access to update internal state.
      *
      * @param currentOffset current accessed file offset
-     * @param segmentSize segment size in bytes
      * @return true if this access should trigger readahead
      */
-    boolean shouldTrigger(long currentOffset, int segmentSize);
+    boolean shouldTrigger(long currentOffset);
 
     /**
      * @return initial readahead window (in segments)
