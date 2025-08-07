@@ -6,7 +6,7 @@ package org.opensearch.index.store.read_ahead.impl;
 
 import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
 
-import org.opensearch.index.store.read_ahead.ReadAheadPolicy;
+import org.opensearch.index.store.read_ahead.ReadaheadPolicy;
 
 /**
  * Adaptive ReadaheadPolicy implementation with windowing strategy.
@@ -31,7 +31,7 @@ import org.opensearch.index.store.read_ahead.ReadAheadPolicy;
  *
  * Inspired by Linux readahead_state.
  */
-public class WindowedReadaheadPolicy implements ReadAheadPolicy {
+public class WindowedReadaheadPolicy implements ReadaheadPolicy {
 
     private final int initialWindow;
     private final int maxWindow;

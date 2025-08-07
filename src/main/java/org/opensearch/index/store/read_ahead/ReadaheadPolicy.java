@@ -7,7 +7,7 @@ package org.opensearch.index.store.read_ahead;
 /**
  * Defines how readahead should behave depending on access pattern.
  */
-public interface ReadAheadPolicy {
+public interface ReadaheadPolicy {
 
     /**
      * Called on every segment access to update internal state.

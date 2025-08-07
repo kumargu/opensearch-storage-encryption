@@ -34,7 +34,7 @@ import java.io.Closeable;
  *
  */
 
-public interface ReadAheadContext extends Closeable {
+public interface ReadaheadContext extends Closeable {
 
     /**
      * Called on each segment load to update access pattern and possibly trigger readahead.

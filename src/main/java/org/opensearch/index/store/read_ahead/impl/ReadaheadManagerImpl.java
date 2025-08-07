@@ -9,31 +9,31 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.index.store.read_ahead.ReadAheadContext;
-import org.opensearch.index.store.read_ahead.ReadAheadManager;
+import org.opensearch.index.store.read_ahead.ReadaheadContext;
+import org.opensearch.index.store.read_ahead.ReadaheadManager;
 import org.opensearch.index.store.read_ahead.Worker;
 
 /**
  * ReadaheadManager for single IndexInput.
  *
- * - Holds a single ReadAheadContext for the lifetime of the IndexInput.
+ * - Holds a single ReadaheadContext for the lifetime of the IndexInput.
  * - Delegates scheduling to a ReadAheadWorker.
  * - No registry map needed because lifetime is tied to IndexInput.
  */
-public class ReadaheadManagerImpl implements ReadAheadManager {
+public class ReadaheadManagerImpl implements ReadaheadManager {
 
     private static final Logger LOGGER = LogManager.getLogger(ReadaheadManagerImpl.class);
 
     private final Worker worker;
     private final AtomicBoolean closed = new AtomicBoolean(false);
-    private ReadAheadContext context;
+    private ReadaheadContext context;
 
     public ReadaheadManagerImpl(Worker worker) {
         this.worker = worker;
     }
 
     @Override
-    public ReadAheadContext register(Path path, long fileLength) {
+    public ReadaheadContext register(Path path, long fileLength) {
         if (closed.get()) {
             throw new IllegalStateException("ReadaheadManager is closed");
         }
@@ -51,7 +51,7 @@ public class ReadaheadManagerImpl implements ReadAheadManager {
     }
 
     @Override
-    public void onSegmentAccess(ReadAheadContext ctx, long startFileOffset, boolean cacheMiss) {
+    public void onSegmentAccess(ReadaheadContext ctx, long startFileOffset, boolean cacheMiss) {
         if (closed.get() || ctx == null) {
             return;
         }
@@ -59,7 +59,7 @@ public class ReadaheadManagerImpl implements ReadAheadManager {
     }
 
     @Override
-    public void cancel(ReadAheadContext ctx) {
+    public void cancel(ReadaheadContext ctx) {
         if (ctx != null) {
             ctx.close();
             LOGGER.debug("Cancelled readahead for context {}", ctx);

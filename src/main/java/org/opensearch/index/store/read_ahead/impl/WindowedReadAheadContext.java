@@ -12,10 +12,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.index.store.read_ahead.ReadAheadContext;
+import org.opensearch.index.store.read_ahead.ReadaheadContext;
 import org.opensearch.index.store.read_ahead.Worker;
 
-public class WindowedReadAheadContext implements ReadAheadContext {
+public class WindowedReadAheadContext implements ReadaheadContext {
     private static final Logger LOGGER = LogManager.getLogger(WindowedReadAheadConfig.class);
 
     private final Path path;

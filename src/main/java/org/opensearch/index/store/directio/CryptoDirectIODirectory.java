@@ -32,8 +32,8 @@ import org.opensearch.index.store.block_cache.CaffeineBlockCache;
 import org.opensearch.index.store.block_cache.Pool;
 import org.opensearch.index.store.block_cache.RefCountedMemorySegment;
 import org.opensearch.index.store.iv.KeyIvResolver;
-import org.opensearch.index.store.read_ahead.ReadAheadContext;
-import org.opensearch.index.store.read_ahead.ReadAheadManager;
+import org.opensearch.index.store.read_ahead.ReadaheadContext;
+import org.opensearch.index.store.read_ahead.ReadaheadManager;
 
 @SuppressWarnings("preview")
 @SuppressForbidden(reason = "uses custom DirectIO")
@@ -45,7 +45,7 @@ public final class CryptoDirectIODirectory extends FSDirectory {
     private final BlockCache<RefCountedMemorySegment> blockCache;
     private final BlockLoader<RefCountedMemorySegment> blockLoader;
 
-    private final ReadAheadManager readAheadManager;
+    private final ReadaheadManager readAheadManager;
 
     private final KeyIvResolver keyIvResolver;
 
@@ -57,7 +57,7 @@ public final class CryptoDirectIODirectory extends FSDirectory {
         Pool<MemorySegment> memorySegmentPool,
         BlockCache<RefCountedMemorySegment> blockCache,
         BlockLoader<RefCountedMemorySegment> blockLoader,
-        ReadAheadManager readAheadManager
+        ReadaheadManager readAheadManager
     )
         throws IOException {
         super(path, lockFactory);
@@ -92,7 +92,7 @@ public final class CryptoDirectIODirectory extends FSDirectory {
         MemorySegment[] segments = new MemorySegment[numCacheBlocks];
         RefCountedMemorySegment[] refSegments = new RefCountedMemorySegment[numCacheBlocks];
         // Create a new ReadAheadContext for this specific file
-        ReadAheadContext readAheadContext = readAheadManager.register(file, size);
+        ReadaheadContext readAheadContext = readAheadManager.register(file, size);
 
         try (FileChannel fc = FileChannel.open(file, StandardOpenOption.READ)) {
             long fileOffset = 0;

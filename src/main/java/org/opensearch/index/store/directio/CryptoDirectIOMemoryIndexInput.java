@@ -30,8 +30,8 @@ import org.opensearch.index.store.block_cache.BlockCache;
 import org.opensearch.index.store.block_cache.BlockCacheValue;
 import org.opensearch.index.store.block_cache.BlockLoader;
 import org.opensearch.index.store.block_cache.RefCountedMemorySegment;
-import org.opensearch.index.store.read_ahead.ReadAheadContext;
-import org.opensearch.index.store.read_ahead.ReadAheadManager;
+import org.opensearch.index.store.read_ahead.ReadaheadContext;
+import org.opensearch.index.store.read_ahead.ReadaheadManager;
 
 @SuppressForbidden(reason = "temporary bypass")
 @SuppressWarnings("preview")
@@ -56,8 +56,8 @@ public class CryptoDirectIOMemoryIndexInput extends IndexInput implements Random
     final Path path;
     final BlockCache<RefCountedMemorySegment> blockCache;
     final BlockLoader<RefCountedMemorySegment> blockLoader;
-    final ReadAheadManager readaheadManager;
-    final ReadAheadContext readaheadContext;
+    final ReadaheadManager readaheadManager;
+    final ReadaheadContext readaheadContext;
     final String resourceDescription;
     final byte[] key;
     final byte[] iv;
@@ -75,8 +75,8 @@ public class CryptoDirectIOMemoryIndexInput extends IndexInput implements Random
         Arena arena,
         BlockCache<RefCountedMemorySegment> blockCache,
         BlockLoader<RefCountedMemorySegment> blockLoader,
-        ReadAheadManager readAheadManager,
-        ReadAheadContext readAheadContext,
+        ReadaheadManager readAheadManager,
+        ReadaheadContext readAheadContext,
         MemorySegment[] segments,
         RefCountedMemorySegment[] refSegments,
         long length,
@@ -135,8 +135,8 @@ public class CryptoDirectIOMemoryIndexInput extends IndexInput implements Random
         Arena arena,
         BlockCache<RefCountedMemorySegment> blockCache,
         BlockLoader<RefCountedMemorySegment> blockLoader,
-        ReadAheadManager readaheadManager,
-        ReadAheadContext readaheadContext,
+        ReadaheadManager readaheadManager,
+        ReadaheadContext readaheadContext,
         MemorySegment[] segments,
         RefCountedMemorySegment[] refSegments,
         long absoluteBaseOffset,
@@ -751,8 +751,8 @@ public class CryptoDirectIOMemoryIndexInput extends IndexInput implements Random
             Arena arena,
             BlockCache<RefCountedMemorySegment> blockCache,
             BlockLoader<RefCountedMemorySegment> blockLoader,
-            ReadAheadManager readaheadManager,
-            ReadAheadContext readaheadContext,
+            ReadaheadManager readaheadManager,
+            ReadaheadContext readaheadContext,
             MemorySegment segment,
             RefCountedMemorySegment[] refSegments,
             long absoluteBaseOffset,    // absolute file offset of first segment
@@ -867,8 +867,8 @@ public class CryptoDirectIOMemoryIndexInput extends IndexInput implements Random
             Arena arena,
             BlockCache<RefCountedMemorySegment> blockCache,
             BlockLoader<RefCountedMemorySegment> blockLoader,
-            ReadAheadManager readaheadManager,
-            ReadAheadContext readaheadContext,
+            ReadaheadManager readaheadManager,
+            ReadaheadContext readaheadContext,
             MemorySegment[] segments,
             RefCountedMemorySegment[] refSegments,
             long offset,
