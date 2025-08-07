@@ -4,6 +4,9 @@
  */
 package org.opensearch.index.store.directio;
 
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_MASK;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
+
 import java.io.EOFException;
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -27,8 +30,6 @@ import org.opensearch.index.store.block_cache.BlockCache;
 import org.opensearch.index.store.block_cache.BlockCacheValue;
 import org.opensearch.index.store.block_cache.BlockLoader;
 import org.opensearch.index.store.block_cache.RefCountedMemorySegment;
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_MASK;
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
 import org.opensearch.index.store.read_ahead.ReadAheadContext;
 import org.opensearch.index.store.read_ahead.ReadAheadManager;
 

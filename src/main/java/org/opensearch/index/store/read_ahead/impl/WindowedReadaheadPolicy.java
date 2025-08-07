@@ -5,6 +5,7 @@
 package org.opensearch.index.store.read_ahead.impl;
 
 import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
+
 import org.opensearch.index.store.read_ahead.ReadAheadPolicy;
 
 /**

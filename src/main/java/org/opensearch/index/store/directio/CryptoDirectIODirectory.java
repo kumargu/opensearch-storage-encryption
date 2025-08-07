@@ -4,6 +4,9 @@
  */
 package org.opensearch.index.store.directio;
 
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE_POWER;
+import static org.opensearch.index.store.directio.DirectIoConfigs.MMAP_SEGMENT_POWER;
+
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.foreign.Arena;
@@ -28,8 +31,6 @@ import org.opensearch.index.store.block_cache.BlockLoader;
 import org.opensearch.index.store.block_cache.CaffeineBlockCache;
 import org.opensearch.index.store.block_cache.Pool;
 import org.opensearch.index.store.block_cache.RefCountedMemorySegment;
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE_POWER;
-import static org.opensearch.index.store.directio.DirectIoConfigs.MMAP_SEGMENT_POWER;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.store.read_ahead.ReadAheadContext;
 import org.opensearch.index.store.read_ahead.ReadAheadManager;
@@ -92,7 +93,7 @@ public final class CryptoDirectIODirectory extends FSDirectory {
         RefCountedMemorySegment[] refSegments = new RefCountedMemorySegment[numCacheBlocks];
         // Create a new ReadAheadContext for this specific file
         ReadAheadContext readAheadContext = readAheadManager.register(file, size);
-        
+
         try (FileChannel fc = FileChannel.open(file, StandardOpenOption.READ)) {
             long fileOffset = 0;
             int blockIndex = 0;
