@@ -15,7 +15,6 @@ import java.util.Map;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.SuppressForbidden;
-import org.opensearch.index.store.block.RefCountedMemorySegment;
 import org.opensearch.index.store.block_loader.BlockLoader;
 import org.opensearch.index.store.pool.Pool;
 
@@ -65,7 +64,7 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
             BlockCacheValue<T> value = cache.get(key, k -> {
                 try {
                     V segment = blockLoader.load(k);
-                    return maybeWrapValueForRefCounting(segment);
+                    return validateAndCast(segment);
                 } catch (Exception e) {
                     return handleLoadException(k, e);
                 }
@@ -88,7 +87,7 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
         cache.asMap().computeIfAbsent(key, k -> {
             try {
                 V segment = blockLoader.load(k);
-                return maybeWrapValueForRefCounting(segment);
+                return validateAndCast(segment);
             } catch (Exception e) {
                 return handleLoadException(k, e);
             }
@@ -154,12 +153,12 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
 
                 long blockOffset = startOffset + i * CACHE_BLOCK_SIZE;
                 BlockCacheKey key = createBlockKey(filePath, blockOffset);
-                BlockCacheValue<T> wrapped = maybeWrapValueForRefCounting(block);
+                BlockCacheValue<T> wrapped = validateAndCast(block);
                 loaded.put(key, wrapped);
 
                 if (cache.asMap().putIfAbsent(key, wrapped) != null) {
-                    // already cached → release immediateky as we won't use it in the cache.
-                    segmentPool.release(block);
+                    // already cached → release our newly loaded segment as we won't use it
+                    wrapped.close();
                 }
             }
 
@@ -182,23 +181,12 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
     }
 
     @SuppressWarnings("unchecked")
-    private BlockCacheValue<T> maybeWrapValueForRefCounting(V loadedBlock) {
+    private BlockCacheValue<T> validateAndCast(V loadedBlock) {
         if (loadedBlock == null) {
-            LOGGER.error("BlockLoader returned null segment");
             throw new IllegalArgumentException("BlockLoader returned null segment");
         }
 
-        // Handle SegmentHandle from MemorySegmentPool
-        if (loadedBlock instanceof org.opensearch.index.store.pool.MemorySegmentPool.SegmentHandle handle) {
-            RefCountedMemorySegment refSegment = new RefCountedMemorySegment(
-                handle.segment(),
-                CACHE_BLOCK_SIZE,
-                seg -> segmentPool.release(loadedBlock)
-            );
-            return (BlockCacheValue<T>) refSegment;
-        }
-
-        // For non-MemorySegment types, return the segment directly
+        // V is expected to be BlockCacheValue<T> (e.g., RefCountedMemorySegment)
         return (BlockCacheValue<T>) loadedBlock;
     }
 

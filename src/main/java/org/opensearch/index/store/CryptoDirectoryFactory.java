@@ -10,9 +10,6 @@ import java.nio.file.Path;
 import java.security.Provider;
 import java.security.Security;
 import java.time.Duration;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
@@ -66,7 +63,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
     private static final Logger LOGGER = LogManager.getLogger(CryptoDirectoryFactory.class);
 
-    private static volatile Pool<MemorySegmentPool.SegmentHandle> sharedSegmentPool;
+    private static volatile Pool<RefCountedMemorySegment> sharedSegmentPool;
     private static volatile BlockCache<RefCountedMemorySegment> sharedBlockCache;
     private static final Object initLock = new Object();
 
@@ -78,18 +75,21 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     }
 
     /**
-     *  Specifies a crypto provider to be used for encryption. The default value is SunJCE.
+     * Specifies a crypto provider to be used for encryption. The default value
+     * is SunJCE.
      */
     public static final Setting<Provider> INDEX_CRYPTO_PROVIDER_SETTING = new Setting<>("index.store.crypto.provider", "SunJCE", (s) -> {
         Provider p = Security.getProvider(s);
         if (p == null) {
             throw new SettingsException("unrecognized [index.store.crypto.provider] \"" + s + "\"");
-        } else
+        } else {
             return p;
+        }
     }, Property.IndexScope, Property.InternalIndex);
 
     /**
-     *  Specifies the Key management plugin type to be used. The desired KMS plugin should be installed.
+     * Specifies the Key management plugin type to be used. The desired KMS
+     * plugin should be installed.
      */
     public static final Setting<String> INDEX_KMS_TYPE_SETTING = new Setting<>("index.store.kms.type", "", Function.identity(), (s) -> {
         if (s == null || s.isEmpty()) {
@@ -115,6 +115,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
     /**
      * {@inheritDoc}
+     *
      * @param indexSettings the index settings
      * @param path the shard file path
      */
@@ -128,10 +129,12 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
     /**
      * {@inheritDoc}
+     *
      * @param location the directory location
      * @param lockFactory the lockfactory for this FS directory
-     * @param indexSettings the read index settings 
-     * @return the concrete implementation of the directory based on index setttings.
+     * @param indexSettings the read index settings
+     * @return the concrete implementation of the directory based on index
+     * setttings.
      * @throws IOException
      */
     protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException {
@@ -207,15 +210,15 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         * - Caffeine eviction is single-threaded by default (runs in caller thread via `Runnable::run`),
         *   which avoids offloading release to background threads that may hold on to native memory.
         * 
-        */
+         */
 
         // Create a per-directory loader that knows about this specific keyIvResolver
-        BlockLoader<MemorySegmentPool.SegmentHandle> loader = new CryptoDirectIOBlockLoader(sharedSegmentPool, keyIvResolver);
+        BlockLoader<RefCountedMemorySegment> loader = new CryptoDirectIOBlockLoader(sharedSegmentPool, keyIvResolver);
 
         // Create a directory-specific cache that wraps the shared cache with this directory's loader
         long maxBlocks = RESEVERED_POOL_SIZE_IN_BYTES / CACHE_BLOCK_SIZE;
         BlockCache<RefCountedMemorySegment> directoryCache = new CaffeineBlockCache<>(
-            ((CaffeineBlockCache<RefCountedMemorySegment, MemorySegmentPool.SegmentHandle>) sharedBlockCache).getCache(),
+            ((CaffeineBlockCache<RefCountedMemorySegment, RefCountedMemorySegment>) sharedBlockCache).getCache(),
             loader,
             sharedSegmentPool,
             maxBlocks
@@ -257,38 +260,26 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                         );
                     sharedSegmentPool.warmUp((long) (maxBlocks * WARM_UP_PERCENTAGE));
 
-                    @SuppressWarnings("resource")
-                    ThreadPoolExecutor removalExec = new ThreadPoolExecutor(4, 8, 60L, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r -> {
-                        Thread t = new Thread(r, "block-cache-maint");
-                        t.setDaemon(true);
-                        return t;
-                    },
-                        new ThreadPoolExecutor.CallerRunsPolicy() // useless since we have an unbounded queue.
-                    );
-
                     Cache<BlockCacheKey, BlockCacheValue<RefCountedMemorySegment>> cache = Caffeine
                         .newBuilder()
                         .initialCapacity(CACHE_INITIAL_SIZE)
                         .recordStats()
                         .maximumSize(maxBlocks)
                         .evictionListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, RemovalCause cause) -> {
-                            if (value != null && cause == RemovalCause.SIZE) {
-                                try {
-                                    value.close();
-                                } catch (Throwable t) {
-                                    LOGGER.warn("Failed to close a cached value during eviction ", t);
-                                }
+                            // Phase 1: Mark as retired to prevent new pins (for BlockSlotTinyCache staleness detection)
+                            // This is called synchronously during eviction, before the value is fully removed
+                            if (value != null) {
+                                value.value().retire();
                             }
                         })
-                        .removalListener((key, value, cause) -> {
-                            if (value != null && cause != RemovalCause.SIZE) {
-                                removalExec.execute(() -> {
-                                    try {
-                                        value.close();
-                                    } catch (Throwable t) {
-                                        LOGGER.warn("Failed to close cached value during removal {}", key, t);
-                                    }
-                                });
+                        .removalListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, RemovalCause cause) -> {
+                            // Phase 2: Drop the cache's reference after the value is removed
+                            if (value != null) {
+                                try {
+                                    value.value().decRef();
+                                } catch (Throwable t) {
+                                    LOGGER.warn("Failed to decRef cached value during removal: key={}, cause={}", key, cause, t);
+                                }
                             }
                         })
                         .build();

@@ -4,9 +4,6 @@
  */
 package org.opensearch.index.store.directio;
 
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE_POWER;
-
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Files;
@@ -27,8 +24,9 @@ import org.opensearch.index.store.block.RefCountedMemorySegment;
 import org.opensearch.index.store.block_cache.BlockCache;
 import org.opensearch.index.store.block_cache.FileBlockCacheKey;
 import org.opensearch.index.store.block_loader.BlockLoader;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE_POWER;
 import org.opensearch.index.store.iv.KeyIvResolver;
-import org.opensearch.index.store.pool.MemorySegmentPool;
 import org.opensearch.index.store.pool.Pool;
 import org.opensearch.index.store.read_ahead.ReadaheadContext;
 import org.opensearch.index.store.read_ahead.ReadaheadManager;
@@ -40,7 +38,7 @@ public final class CryptoDirectIODirectory extends FSDirectory {
     private static final Logger LOGGER = LogManager.getLogger(CryptoDirectIODirectory.class);
     private final AtomicLong nextTempFileCounter = new AtomicLong();
 
-    private final Pool<MemorySegmentPool.SegmentHandle> memorySegmentPool;
+    private final Pool<RefCountedMemorySegment> memorySegmentPool;
     private final BlockCache<RefCountedMemorySegment> blockCache;
     private final Worker readAheadworker;
     private final KeyIvResolver keyIvResolver;
@@ -50,9 +48,9 @@ public final class CryptoDirectIODirectory extends FSDirectory {
         LockFactory lockFactory,
         Provider provider,
         KeyIvResolver keyIvResolver,
-        Pool<MemorySegmentPool.SegmentHandle> memorySegmentPool,
+        Pool<RefCountedMemorySegment> memorySegmentPool,
         BlockCache<RefCountedMemorySegment> blockCache,
-        BlockLoader<MemorySegmentPool.SegmentHandle> blockLoader,
+        BlockLoader<RefCountedMemorySegment> blockLoader,
         Worker worker
     )
         throws IOException {

@@ -203,8 +203,6 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
         } catch (IndexOutOfBoundsException ioobe) {
             throw handlePositionalIOOBE(ioobe, "read", currentPos);
         } catch (NullPointerException | IllegalStateException e) {
-            LOGGER.error("=====Hit an error {}=====", e);
-
             throw alreadyClosed(e);
         }
     }

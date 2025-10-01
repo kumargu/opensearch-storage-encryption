@@ -15,15 +15,17 @@ import java.util.concurrent.locks.ReentrantLock;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.SuppressForbidden;
+import org.opensearch.index.store.block.RefCountedMemorySegment;
 
 @SuppressWarnings("preview")
 @SuppressForbidden(reason = "uses custom DirectIO")
-public class PrimaryMemorySegmentPool implements Pool<MemorySegment>, AutoCloseable {
+public class PrimaryMemorySegmentPool implements Pool<RefCountedMemorySegment>, AutoCloseable {
+
     private static final Logger LOGGER = LogManager.getLogger(MemorySegmentPool.class);
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition notEmpty = lock.newCondition();
-    private final Deque<MemorySegment> freeList = new ArrayDeque<>();
+    private final Deque<RefCountedMemorySegment> freeList = new ArrayDeque<>();
     private final Arena sharedArena;
     private final int segmentSize;
     private final int maxSegments;
@@ -45,10 +47,11 @@ public class PrimaryMemorySegmentPool implements Pool<MemorySegment>, AutoClosea
 
     /**
      * Creates a pool with configurable allocation strategy and zeroing
-     * 
+     *
      * @param totalMemory total memory to manage
      * @param segmentSize size of each segment
-     * @param requiresZeroing if true, zero segments on release; if false, skip for performance
+     * @param requiresZeroing if true, zero segments on release; if false, skip
+     * for performance
      */
     public PrimaryMemorySegmentPool(long totalMemory, int segmentSize, boolean requiresZeroing) {
         if (totalMemory % segmentSize != 0) {
@@ -62,22 +65,25 @@ public class PrimaryMemorySegmentPool implements Pool<MemorySegment>, AutoClosea
     }
 
     @Override
-    public MemorySegment acquire() throws InterruptedException {
+    public RefCountedMemorySegment acquire() throws InterruptedException {
         lock.lock();
         try {
             // Try to get from free list first
             if (!freeList.isEmpty()) {
-                MemorySegment segment = freeList.removeFirst();
+                RefCountedMemorySegment refSegment = freeList.removeFirst();
                 cachedFreeListSize = freeList.size();
-                return segment;
+                // Reset refCount to 1 for new ownership
+                refSegment.getRefCount().set(1);
+                return refSegment;
             }
 
             // Try to allocate new segment if under capacity
             if (allocatedSegments < maxSegments) {
                 MemorySegment segment = sharedArena.allocate(segmentSize);
+                RefCountedMemorySegment refSegment = new RefCountedMemorySegment(segment, segmentSize, this::release);
                 allocatedSegments++;
                 LOGGER.trace("Allocated new segment, total allocated: {}", allocatedSegments);
-                return segment;
+                return refSegment;
             }
 
             if (closed) {
@@ -91,43 +97,12 @@ public class PrimaryMemorySegmentPool implements Pool<MemorySegment>, AutoClosea
     }
 
     @Override
-    public MemorySegment tryAcquire(long timeout, TimeUnit unit) throws InterruptedException {
-        lock.lock();
-        try {
-            if (!freeList.isEmpty()) {
-                MemorySegment segment = freeList.removeFirst();
-                cachedFreeListSize = freeList.size();
-                LOGGER.trace("Acquired segment from free list: remaining free={}", cachedFreeListSize);
-                return segment;
-            }
-
-            // Try to allocate new segment if under capacity
-            if (allocatedSegments < maxSegments) {
-                MemorySegment segment = sharedArena.allocate(segmentSize);
-                allocatedSegments++;
-                return segment;
-            }
-
-            if (closed) {
-                LOGGER.error("Pool is closed - cannot acquire segment");
-                throw new IllegalStateException("Pool is closed");
-            }
-
-            LOGGER
-                .debug(
-                    "Pool exhausted: no free segments available. Pool stats: allocated={}/{}, free={}",
-                    allocatedSegments,
-                    maxSegments,
-                    freeList.size()
-                );
-            throw new PrimaryPoolExhaustedException();
-        } finally {
-            lock.unlock();
-        }
+    public RefCountedMemorySegment tryAcquire(long timeout, TimeUnit unit) throws InterruptedException {
+        return acquire();
     }
 
     @Override
-    public void release(MemorySegment segment) {
+    public void release(RefCountedMemorySegment refSegment) {
         lock.lock();
         try {
             if (closed) {
@@ -136,10 +111,11 @@ public class PrimaryMemorySegmentPool implements Pool<MemorySegment>, AutoClosea
 
             // Optional zeroing for security vs performance trade-off
             if (requiresZeroing) {
-                segment.fill((byte) 0);
+                refSegment.segment().fill((byte) 0);
             }
 
-            freeList.addLast(segment);
+            // Add back to free list (refCount is 0, will be reset to 1 in acquire())
+            freeList.addLast(refSegment);
             cachedFreeListSize = freeList.size();
             notEmpty.signal();
         } finally {
@@ -150,20 +126,22 @@ public class PrimaryMemorySegmentPool implements Pool<MemorySegment>, AutoClosea
     /**
      * Bulk release for releasing multiple segments
      */
-    public void releaseAll(MemorySegment... segments) {
-        if (segments.length == 0)
+    public void releaseAll(RefCountedMemorySegment... segments) {
+        if (segments.length == 0) {
             return;
+        }
 
         lock.lock();
         try {
-            if (closed)
+            if (closed) {
                 return;
+            }
 
-            for (MemorySegment segment : segments) {
+            for (RefCountedMemorySegment refSegment : segments) {
                 if (requiresZeroing) {
-                    segment.fill((byte) 0);
+                    refSegment.segment().fill((byte) 0);
                 }
-                freeList.addLast(segment);
+                freeList.addLast(refSegment);
             }
             cachedFreeListSize = freeList.size();
             notEmpty.signalAll(); // Wake up multiple waiters
@@ -227,13 +205,17 @@ public class PrimaryMemorySegmentPool implements Pool<MemorySegment>, AutoClosea
     public void warmUp(long targetSegments) {
         targetSegments = Math.min(targetSegments, maxSegments);
 
-        if (allocatedSegments >= targetSegments)
+        if (allocatedSegments >= targetSegments) {
             return;
+        }
 
         lock.lock();
         try {
             while (allocatedSegments < targetSegments) {
-                freeList.add(sharedArena.allocate(segmentSize));
+                MemorySegment segment = sharedArena.allocate(segmentSize);
+                RefCountedMemorySegment refSegment = new RefCountedMemorySegment(segment, segmentSize, this::release);
+                // Segments in free list have refCount=1, ready for next acquisition
+                freeList.add(refSegment);
                 allocatedSegments++;
             }
             cachedFreeListSize = freeList.size();
@@ -246,8 +228,9 @@ public class PrimaryMemorySegmentPool implements Pool<MemorySegment>, AutoClosea
     public void close() {
         lock.lock();
         try {
-            if (closed)
+            if (closed) {
                 return;
+            }
             closed = true;
             cachedFreeListSize = 0;
             notEmpty.signalAll();
@@ -273,6 +256,7 @@ public class PrimaryMemorySegmentPool implements Pool<MemorySegment>, AutoClosea
      */
     @SuppressForbidden(reason = "uses custom string builder")
     public static class PoolStats {
+
         public final int maxSegments;
         public final int allocatedSegments;
         public final int freeSegments;

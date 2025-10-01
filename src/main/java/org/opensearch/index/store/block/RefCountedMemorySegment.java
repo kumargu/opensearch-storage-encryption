@@ -9,9 +9,10 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.index.store.block_cache.BlockCacheValue;
 
-@SuppressWarnings("preview")
 /**
  * A wrapper around a  {@link MemorySegment} that implements reference counting and cache semantics.
  * This allows shared use of the segment (e.g. across multiple readers) while ensuring
@@ -22,6 +23,8 @@ import org.opensearch.index.store.block_cache.BlockCacheValue;
  */
 public final class RefCountedMemorySegment implements BlockCacheValue<RefCountedMemorySegment> {
 
+    private static final Logger LOGGER = LogManager.getLogger(RefCountedMemorySegment.class);
+
     /** Underlying memory segment holding the actual data. */
     private final MemorySegment segment;
 
@@ -29,10 +32,10 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
     private final int length;
 
     /**
-     * Reference counter for the segment. Starts at 1 to represent ownership by
-     * the creator (or cache). Clients increment the counter via {@link #incRef()}
+     * Reference counter for the segment. Starts at 1 (constructor gives ownership).
+     * Clients increment the counter via {@link #incRef()}
      * and decrement it via {@link #decRef()}. When the counter reaches zero,
-     * the segment is released.
+     * the segment is released back to the pool.
      *
      * Note: We use AtomicInteger for safe updates in concurrent access scenarios.
      */
@@ -41,8 +44,9 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
     /**
      * Callback to release the memory segment when the reference count reaches zero.
      * Typically this is responsible for returning the segment to a pool or closing it.
+     * The callback receives this RefCountedMemorySegment instance for reuse.
      */
-    private final BlockReleaser<MemorySegment> onFullyReleased;
+    private final BlockReleaser<RefCountedMemorySegment> onFullyReleased;
 
     /**
      * VarHandle for atomic access to the retired field
@@ -62,13 +66,13 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
     private volatile boolean retired = false;
 
     /**
-     * Creates a new reference-counted memory segment.
+     * Creates a callback-based reference-counted memory segment
      *
      * @param segment the actual memory segment being tracked
      * @param length the logical length of the data in the segment
-     * @param onFullyReleased a callback to invoke when the segment is no longer in use
+     * @param onFullyReleased callback to release the segment when ref count reaches zero
      */
-    public RefCountedMemorySegment(MemorySegment segment, int length, BlockReleaser<MemorySegment> onFullyReleased) {
+    public RefCountedMemorySegment(MemorySegment segment, int length, BlockReleaser<RefCountedMemorySegment> onFullyReleased) {
         if (segment == null || onFullyReleased == null) {
             throw new IllegalArgumentException("segment and onFullyReleased must not be null");
         }
@@ -100,7 +104,8 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
         int prev = refCount.getAndDecrement();
         if (prev == 1) {
             // This thread decremented the last ref, so it's responsible for releasing
-            onFullyReleased.release(segment);
+            // Pass this wrapper to the callback for reuse
+            onFullyReleased.release(this);
         } else if (prev <= 0) {
             throw new IllegalStateException("decRef underflow (refCount=" + (prev - 1) + ')');
         }
@@ -144,7 +149,9 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
             while (!this.retired) {
                 int r = refCount.get();
                 if (r == 0) {
-                    return false; // already released
+                    // Segment has been released - should not be in cache
+                    LOGGER.error("tryPin FAILED: refCount=0 (segment released but still in cache), retired={}", this.retired);
+                    return false;
                 }
 
                 if (refCount.compareAndSet(r, r + 1)) {
@@ -154,9 +161,12 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
                 Thread.onSpinWait();
             }
 
-            return false; // retired while we were spinning
+            // Segment retired - normal eviction path
+            LOGGER.info("tryPin FAILED: segment retired (normal eviction), refCount={}", refCount.get());
+            return false;
         } catch (IllegalStateException e) {
             // Race condition occurred - segment was released during pinning attempt
+            LOGGER.warn("tryPin FAILED: IllegalStateException during pin attempt", e);
             return false;
         }
     }
@@ -170,12 +180,23 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
     }
 
     /**
+     * Marks this segment as retired without decrementing the reference count.
+     * This is used during cache eviction to prevent new pins while keeping the segment
+     * alive for existing readers.
+     *
+     * @return true if this call retired the segment, false if already retired
+     */
+    public boolean retire() {
+        return (boolean) RETIRED.compareAndSet(this, false, true);
+    }
+
+    /**
      * Closes this cache value, marking it as retired and dropping the cache's reference.
      * Called exactly once by the cache's removal listener.
      */
     @Override
     public void close() {
-        if ((boolean) RETIRED.compareAndSet(this, false, true)) {
+        if (retire()) {
             // Drop the cache's ownership reference. If no readers are pinned, this will free now.
             decRef();
         }
