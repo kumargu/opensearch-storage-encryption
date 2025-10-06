@@ -57,14 +57,35 @@ import com.github.benmanes.caffeine.cache.RemovalCause;
 
 @SuppressForbidden(reason = "temporary")
 /**
- * Factory for an encrypted filesystem directory
+ * Factory for creating encrypted filesystem directories with support for various storage types.
+ *
+ * Supports:
+ * - NIOFS: NIO-based encrypted file system
+ * - HYBRIDFS: Hybrid directory with Direct I/O and block caching
+ * - MMAPFS: Not supported (throws AssertionError)
+ *
+ * The factory maintains node-level shared resources (pool and cache) for efficient
+ * memory utilization across all encrypted directories.
  */
 public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory {
 
     private static final Logger LOGGER = LogManager.getLogger(CryptoDirectoryFactory.class);
 
+    /**
+     * Shared pool of RefCountedMemorySegments for Direct I/O operations.
+     * Initialized once per node and shared across all CryptoDirectIODirectory instances.
+     */
     private static volatile Pool<RefCountedMemorySegment> sharedSegmentPool;
+
+    /**
+     * Shared block cache for decrypted data blocks.
+     * Initialized once per node and shared across all CryptoDirectIODirectory instances.
+     */
     private static volatile BlockCache<RefCountedMemorySegment> sharedBlockCache;
+
+    /**
+     * Lock for thread-safe initialization of shared resources.
+     */
     private static final Object initLock = new Object();
 
     /**
@@ -128,14 +149,13 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     }
 
     /**
-     * {@inheritDoc}
+     * Creates an encrypted directory based on the configured store type.
      *
      * @param location the directory location
-     * @param lockFactory the lockfactory for this FS directory
-     * @param indexSettings the read index settings
-     * @return the concrete implementation of the directory based on index
-     * setttings.
-     * @throws IOException
+     * @param lockFactory the lock factory for this directory
+     * @param indexSettings the index settings
+     * @return the concrete implementation of the encrypted directory based on store type
+     * @throws IOException if directory creation fails
      */
     protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException {
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
@@ -146,7 +166,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
         switch (type) {
             case HYBRIDFS -> {
-                LOGGER.debug("Using HYBRIDFS directory");
+                LOGGER.debug("Using HYBRIDFS directory with Direct I/O and block caching");
 
                 CryptoDirectIODirectory cryptoDirectIODirectory = createCryptoDirectIODirectory(
                     location,
@@ -160,7 +180,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                 throw new AssertionError("MMAPFS not supported with index level encryption");
             }
             case SIMPLEFS, NIOFS -> {
-                LOGGER.debug("Using NIOFS directory");
+                LOGGER.debug("Using NIOFS directory for encrypted storage");
                 return new CryptoNIOFSDirectory(lockFactory, location, provider, keyIvResolver);
             }
             default -> throw new AssertionError("unexpected built-in store type [" + type + "]");
@@ -176,46 +196,42 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     ) throws IOException {
         /*
         * ================================
-        * Shared Block Cache with RefCountedMemorySegment
+        * Shared Block Cache Architecture
         * ================================
         *
-        * This shared Caffeine cache stores decrypted MemorySegment blocks for direct I/O access,
-        * using reference counting to ensure safe reuse across multiple readers and directories.
+        * This method creates a CryptoDirectIODirectory that uses node-level shared resources
+        * (pool and cache) for efficient memory utilization and high cache hit rates.
         *
-        * Cache Type:
-        * ------------
-        * - Key:   BlockCacheKey (typically includes file path, offset, etc.)
-        * - Value: BlockCacheValue<RefCountedMemorySegment>
+        * Shared Resources:
+        * -----------------
+        * - sharedSegmentPool: Pool of RefCountedMemorySegments (initialized in initializeSharedPool)
+        * - sharedBlockCache: Caffeine cache storing decrypted blocks (initialized in initializeSharedPool)
+        *
+        * Per-Directory Resources:
+        * ------------------------
+        * - BlockLoader: Directory-specific loader using this directory's keyIvResolver for decryption
+        * - Cache Wrapper: Wraps the shared cache with directory-specific loader
+        * - ReadAhead Worker: Asynchronous prefetching for sequential reads
         *
         * Memory Lifecycle:
-        * ------------------
-        * - Each cached block is a RefCountedMemorySegment, which wraps a MemorySegment
-        *   and manages its lifetime via reference counting.
+        * -----------------
+        * 1. Cache miss: Loader reads encrypted data, decrypts it, stores in RefCountedMemorySegment
+        * 2. Initial refCount=1 (cache's reference)
+        * 3. Reader pins: refCount incremented via tryPin()
+        * 4. Reader unpins: refCount decremented via decRef()
+        * 5. Cache eviction: retired=true set (prevents new pins), then decRef() called
+        * 6. refCount=0: Segment returned to pool for reuse
         *
-        * - On load, we increment the reference count via `incRef()` for each use
-        *   (i.e., each IndexInput clone or slice).
-        *
-        * - On close, `decRef()` is called. When the count hits zero, the underlying
-        *   MemorySegment is released via a `SegmentReleaser` (typically returning
-        *   the segment to a pool or freeing it).
-        *
-        * Global Sharing:
-        * ---------------
-        * - The cache is now shared across all CryptoDirectIODirectory instances per node,
-        *   improving memory efficiency and cache hit rates across different indexes.
-        * - Cache size matches the pool size to ensure optimal memory utilization.
-        *
-        * Threading:
-        * -----------
-        * - Caffeine eviction is single-threaded by default (runs in caller thread via `Runnable::run`),
-        *   which avoids offloading release to background threads that may hold on to native memory.
-        * 
-         */
+        * Two-Phase Eviction (prevents stale reads):
+        * -------------------------------------------
+        * - evictionListener: Sets retired=true (marks stale for BlockSlotTinyCache)
+        * - removalListener: Calls decRef() (releases cache's reference)
+        */
 
-        // Create a per-directory loader that knows about this specific keyIvResolver
+        // Create a per-directory loader that uses this directory's keyIvResolver for decryption
         BlockLoader<RefCountedMemorySegment> loader = new CryptoDirectIOBlockLoader(sharedSegmentPool, keyIvResolver);
 
-        // Create a directory-specific cache that wraps the shared cache with this directory's loader
+        // Wrap the shared cache with directory-specific loader
         long maxBlocks = RESEVERED_POOL_SIZE_IN_BYTES / CACHE_BLOCK_SIZE;
         BlockCache<RefCountedMemorySegment> directoryCache = new CaffeineBlockCache<>(
             ((CaffeineBlockCache<RefCountedMemorySegment, RefCountedMemorySegment>) sharedBlockCache).getCache(),
@@ -224,6 +240,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
             maxBlocks
         );
 
+        // Create read-ahead worker for asynchronous prefetching
         int threads = Math.max(4, Runtime.getRuntime().availableProcessors() / 4);
         Worker readaheadWorker = new QueuingWorker(READ_AHEAD_QUEUE_SIZE, threads, directoryCache);
 
@@ -242,6 +259,20 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     /**
      * Initialize the shared MemorySegmentPool and BlockCache once per node.
      * This method is called from CryptoDirectoryPlugin.createComponents().
+     *
+     * Thread Safety:
+     * - Uses double-checked locking for initialization
+     * - Safe to call multiple times (idempotent)
+     *
+     * Cache Eviction Strategy:
+     * - Two-phase eviction to prevent stale reads from BlockSlotTinyCache
+     * - Phase 1 (evictionListener): Sets retired=true to mark segment as stale
+     * - Phase 2 (removalListener): Calls decRef() to release cache's reference
+     *
+     * Why separate listeners?
+     * - evictionListener fires during eviction (value might still be in cache momentarily)
+     * - Setting retired=true first prevents new pins while allowing existing readers to finish
+     * - removalListener fires after removal completes, safely releasing the reference
      */
     public static void initializeSharedPool() {
         if (sharedSegmentPool == null || sharedBlockCache == null) {
@@ -249,7 +280,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                 if (sharedSegmentPool == null || sharedBlockCache == null) {
                     long maxBlocks = RESEVERED_POOL_SIZE_IN_BYTES / CACHE_BLOCK_SIZE;
 
-                    // Initialize shared pool
+                    // Initialize shared memory pool with warmup
                     sharedSegmentPool = new MemorySegmentPool(RESEVERED_POOL_SIZE_IN_BYTES, CACHE_BLOCK_SIZE);
                     LOGGER
                         .info(
@@ -260,20 +291,24 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                         );
                     sharedSegmentPool.warmUp((long) (maxBlocks * WARM_UP_PERCENTAGE));
 
+                    // Initialize shared cache with two-phase eviction
                     Cache<BlockCacheKey, BlockCacheValue<RefCountedMemorySegment>> cache = Caffeine
                         .newBuilder()
                         .initialCapacity(CACHE_INITIAL_SIZE)
                         .recordStats()
                         .maximumSize(maxBlocks)
                         .evictionListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, RemovalCause cause) -> {
-                            // Phase 1: Mark as retired to prevent new pins (for BlockSlotTinyCache staleness detection)
-                            // This is called synchronously during eviction, before the value is fully removed
+                            // Phase 1: Mark as retired to prevent new pins
+                            // This prevents BlockSlotTinyCache from serving stale data
+                            // Called synchronously during eviction (before value is fully removed from cache)
                             if (value != null) {
                                 value.value().retire();
                             }
                         })
                         .removalListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, RemovalCause cause) -> {
-                            // Phase 2: Drop the cache's reference after the value is removed
+                            // Phase 2: Release the cache's reference (refCount decremented)
+                            // Called after value is fully removed from cache
+                            // When refCount reaches 0, segment is returned to pool for reuse
                             if (value != null) {
                                 try {
                                     value.value().decRef();
@@ -294,6 +329,9 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         }
     }
 
+    /**
+     * Publishes pool statistics to the logger for monitoring and debugging.
+     */
     private static void publishPoolStats() {
         try {
             LOGGER.info("{}", sharedSegmentPool.poolStats());
@@ -302,6 +340,10 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         }
     }
 
+    /**
+     * Starts a background daemon thread that periodically logs pool statistics.
+     * Logs every 5 minutes to help monitor memory usage and pool health.
+     */
     private static void startTelemetry() {
         Thread loggerThread = new Thread(() -> {
             while (true) {

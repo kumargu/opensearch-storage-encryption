@@ -72,8 +72,8 @@ public class PrimaryMemorySegmentPool implements Pool<RefCountedMemorySegment>, 
             if (!freeList.isEmpty()) {
                 RefCountedMemorySegment refSegment = freeList.removeFirst();
                 cachedFreeListSize = freeList.size();
-                // Reset refCount to 1 for new ownership
-                refSegment.getRefCount().set(1);
+                // Reset to fresh state (refCount=1, retired=false)
+                refSegment.reset();
                 return refSegment;
             }
 
