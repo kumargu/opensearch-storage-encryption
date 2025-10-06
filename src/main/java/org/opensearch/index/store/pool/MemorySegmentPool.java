@@ -14,13 +14,16 @@ import org.opensearch.index.store.block.RefCountedMemorySegment;
 /**
  * Exception hierarchy for memory pool exhaustion
  */
+
 class PoolExhaustedException extends RuntimeException {
+
     public PoolExhaustedException(String message) {
         super(message);
     }
 }
 
 class PrimaryPoolExhaustedException extends PoolExhaustedException {
+
     public PrimaryPoolExhaustedException() {
         super("Primary pool exhausted: no free segments available");
     }
@@ -33,6 +36,7 @@ class SecondaryPoolExhaustedException extends PoolExhaustedException {
 }
 
 class SecondaryPoolUnavailableException extends PoolExhaustedException {
+
     public SecondaryPoolUnavailableException(String reason) {
         super("Secondary pool unavailable: " + reason);
     }
@@ -61,31 +65,24 @@ public class MemorySegmentPool implements Pool<RefCountedMemorySegment>, AutoClo
 
     @Override
     public RefCountedMemorySegment acquire() throws InterruptedException {
-        // Fast path: try primary if available
-        if (!primaryPool.isUnderPressure()) {
-            try {
-                return primaryPool.acquire();
-            } catch (PrimaryPoolExhaustedException e) {
-                // Rare race: became exhausted between check and acquire
-            }
-        }
-
-        // Fallback to secondary pool (already slow path, skip pressure check)
-        tryAcquireFromSecondary();
-        if (secondaryPool != null) {
-            try {
-                return secondaryPool.acquire();
-            } catch (SecondaryPoolExhaustedException e) {
-                // Exhausted, fall through to ephemeral
-            }
-        }
-
-        // Final fallback to ephemeral pool
+        // Try primary pool first
         try {
-            EphemeralMemorySegmentPool ephemeral = new EphemeralMemorySegmentPool(primaryPool.pooledSegmentSize());
-            return ephemeral.acquire();
-        } catch (Exception ee) {
-            throw new NoOffHeapMemoryException();
+            return primaryPool.acquire();
+        } catch (PrimaryPoolExhaustedException e) {
+            // Fallback to secondary pool
+            try {
+                tryAcquireFromSecondary();
+                return secondaryPool.acquire();
+
+            } catch (SecondaryPoolExhaustedException | SecondaryPoolUnavailableException se) {
+                // Final fallback to ephemeral pool
+                try {
+                    EphemeralMemorySegmentPool ephemeral = new EphemeralMemorySegmentPool(primaryPool.pooledSegmentSize());
+                    return ephemeral.acquire();
+                } catch (Exception ee) {
+                    throw new NoOffHeapMemoryException();
+                }
+            }
         }
     }
 

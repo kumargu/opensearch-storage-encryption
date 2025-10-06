@@ -5,7 +5,6 @@
 package org.opensearch.index.store.block;
 
 import java.lang.foreign.MemorySegment;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.logging.log4j.LogManager;
@@ -64,12 +63,20 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
     private final BlockReleaser<RefCountedMemorySegment> onFullyReleased;
 
     /**
-     * Retirement flag indicating this segment has been evicted from cache.
-     * When true, {@link #tryPin()} will fail, preventing new readers from using stale data.
-     * Existing pinned readers can continue using the segment until they unpin.
-     * Uses AtomicBoolean for thread-safe CAS operations.
+     * Generation counter incremented on each eviction (close) cycle.
+     * Used by BlockSlotTinyCache to detect stale cached references.
+     *
+     * Incremented when:
+     * - close() is called (segment evicted from cache)
+     *
+     * NOT incremented when:
+     * - reset() is called (segment reused from pool)
+     *
+     * This allows generation-based staleness detection without a separate retired flag.
+     * Once close() increments generation, all cached references with the old generation
+     * become invalid, preventing use of stale or recycled memory.
      */
-    private final AtomicBoolean retired = new AtomicBoolean(false);
+    private final AtomicInteger generation = new AtomicInteger(0);
 
     /**
      * Creates a reference-counted memory segment.
@@ -168,30 +175,24 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
      */
     @Override
     public boolean tryPin() {
-        try {
-            while (!this.retired.get()) {
-                int r = refCount.get();
-                if (r == 0) {
-                    // Segment fully released but still in cache - should never happen
-                    LOGGER.error("tryPin FAILED: refCount=0 (segment released but still in cache), retired={}", this.retired.get());
-                    return false;
-                }
-
-                if (refCount.compareAndSet(r, r + 1)) {
-                    return true; // Pin acquired successfully
-                }
-
-                Thread.onSpinWait(); // Backoff for CAS retry
-            }
-
-            // Segment retired - normal eviction path (BlockSlotTinyCache will detect via isRetired())
-            LOGGER.debug("tryPin FAILED: segment retired (normal eviction), refCount={}", refCount.get());
-            return false;
-        } catch (IllegalStateException e) {
-            // Race: segment released during pin attempt
-            LOGGER.warn("tryPin FAILED: IllegalStateException during pin attempt", e);
+        int r = refCount.get();
+        if (r == 0) {
+            // Segment fully released - should not be in cache
+            LOGGER.error("tryPin FAILED: refCount=0 (segment released but still in cache)");
             return false;
         }
+
+        // Try to increment refCount
+        while (r > 0) {
+            if (refCount.compareAndSet(r, r + 1)) {
+                return true; // Pin acquired successfully
+            }
+            r = refCount.get();
+            Thread.onSpinWait(); // Backoff for CAS retry
+        }
+
+        // RefCount reached 0 during our attempt
+        return false;
     }
 
     /**
@@ -206,20 +207,6 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
     }
 
     /**
-     * Marks this segment as retired without decrementing the reference count.
-     * Uses CAS to ensure atomic retirement (only first caller succeeds).
-     *
-     * <p>This prevents new pins ({@link #tryPin()} will fail) while allowing existing
-     * readers to continue safely until they unpin. The segment is only freed when
-     * refCount reaches 0 (after {@link #decRef()}).
-     *
-     * @return true if this call retired the segment, false if already retired
-     */
-    public boolean retire() {
-        return this.retired.compareAndSet(false, true);
-    }
-
-    /**
      * Resets this segment to a fresh state for reuse from the pool.
      * Must be called when a segment is reacquired from the free list.
      *
@@ -228,34 +215,44 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
      *
      * <p>Resets:
      * <ul>
-     *   <li>retired flag to false (allows new pins)</li>
      *   <li>refCount to 1 (represents new cache/owner reference)</li>
      * </ul>
+     *
+     * <p>Does NOT increment generation - that happens in close() when evicted.
      */
     public void reset() {
-        this.retired.set(false);
         this.refCount.set(1);
     }
 
     /**
-     * Closes this cache value by retiring it and dropping the cache's reference.
-     * Safe to call multiple times - only the first call will decRef.
+     * Returns the current generation number.
+     * Used by BlockSlotTinyCache to detect segment reuse.
      *
-     * <p>This method atomically:
+     * @return current generation counter value
+     */
+    public int getGeneration() {
+        return generation.get();
+    }
+
+    /**
+     * Closes this cache value by invalidating it and dropping the cache's reference.
+     * Safe to call multiple times - generation increment is idempotent-ish (just keeps incrementing).
+     *
+     * <p>This method:
      * <ol>
-     *   <li>Sets retired=true via CAS (prevents new pins)</li>
-     *   <li>If CAS succeeds, calls decRef() (drops cache's reference)</li>
+     *   <li>Increments generation (invalidates all cached references in BlockSlotTinyCache)</li>
+     *   <li>Calls decRef() (drops cache's reference)</li>
      * </ol>
      *
-     * <p>The CAS ensures that even if close() is called multiple times,
-     * decRef() is only called once.
+     * <p>Once generation is incremented, any BlockSlotTinyCache entries with the old
+     * generation will fail the generation check and reload from the main cache.
      */
     @Override
     public void close() {
-        if (retire()) {
-            // Drop the cache's reference. Segment freed when last reader unpins.
-            decRef();
-        }
+        // Increment generation to invalidate cached references
+        generation.incrementAndGet();
+        // Drop the cache's reference. Segment freed when last reader unpins.
+        decRef();
     }
 
     /**
@@ -270,14 +267,14 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
 
     /**
      * Checks if this segment has been retired from the cache.
+     * No longer needed - generation-based staleness detection is used instead.
      *
-     * <p>Used by {@link org.opensearch.index.store.directio.BlockSlotTinyCache} to detect stale
-     * cached references after eviction.
-     *
-     * @return true if retired (segment evicted from cache), false otherwise
+     * @return always false (deprecated, kept for interface compatibility)
+     * @deprecated Use generation-based staleness detection instead
      */
     @Override
+    @Deprecated
     public boolean isRetired() {
-        return this.retired.get();
+        return false;
     }
 }
