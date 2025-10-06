@@ -191,11 +191,20 @@ public class PrimaryMemorySegmentPool implements Pool<RefCountedMemorySegment>, 
     }
 
     /**
-     * Check if pool is under memory pressure
+     * Check if pool is under memory pressure.
+     * Returns true when available capacity (free + unallocated) is low.
+     *
+     * This drives the decision to use secondary pool vs primary pool.
      */
     @Override
     public boolean isUnderPressure() {
-        return allocatedSegments > (maxSegments * 0.9) && cachedFreeListSize < (maxSegments * 0.1);
+        // Calculate available segments (can be served immediately without blocking)
+        int free = cachedFreeListSize;
+        int unallocated = maxSegments - allocatedSegments;
+        int available = free + unallocated;
+
+        // Under pressure if less than x% of pool capacity is available
+        return available < (maxSegments * 0.1);
     }
 
     /**
@@ -262,28 +271,31 @@ public class PrimaryMemorySegmentPool implements Pool<RefCountedMemorySegment>, 
         public final int freeSegments;
         public final int unallocatedSegments;
         public final double utilizationRatio;
-        public final double pressureRatio;
+        public final double allocationRatio;
 
         PoolStats(int maxSegments, int allocatedSegments, int freeSegments, int unallocatedSegments) {
             this.maxSegments = maxSegments;
             this.allocatedSegments = allocatedSegments;
             this.freeSegments = freeSegments;
             this.unallocatedSegments = unallocatedSegments;
+            // Utilization: % of pool capacity actively in use (allocated - free) / max
+            // This represents segments held by readers/cache
             this.utilizationRatio = (double) (allocatedSegments - freeSegments) / maxSegments;
-            this.pressureRatio = (double) allocatedSegments / maxSegments;
+            // Allocation: % of pool capacity allocated from OS (may be in use or free)
+            this.allocationRatio = (double) allocatedSegments / maxSegments;
         }
 
         @Override
         public String toString() {
             return String
                 .format(
-                    "PoolStats[max=%d, allocated=%d, free=%d, unallocated=%d, utilization=%.1f%%, pressure=%.1f%%]",
+                    "PoolStats[max=%d, allocated=%d, free=%d, unallocated=%d, utilization=%.1f%%, allocation=%.1f%%]",
                     maxSegments,
                     allocatedSegments,
                     freeSegments,
                     unallocatedSegments,
                     utilizationRatio * 100,
-                    pressureRatio * 100
+                    allocationRatio * 100
                 );
         }
     }

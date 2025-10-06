@@ -162,9 +162,19 @@ public class SecondaryMemorySegmentPool implements Pool<RefCountedMemorySegment>
         return segmentSize;
     }
 
+    /**
+     * Check if pool is under memory pressure.
+     * Returns true when available capacity (free + unallocated) is low.
+     */
     @Override
     public boolean isUnderPressure() {
-        return allocatedSegments > (maxSegments * 0.9) && cachedFreeListSize < (maxSegments * 0.1);
+        // Calculate available segments (can be served immediately without blocking)
+        int free = cachedFreeListSize;
+        int unallocated = maxSegments - allocatedSegments;
+        int available = free + unallocated;
+
+        // Under pressure if less than x% of pool capacity is available
+        return available < (maxSegments * 0.1);
     }
 
     @Override
@@ -178,14 +188,17 @@ public class SecondaryMemorySegmentPool implements Pool<RefCountedMemorySegment>
         int free = cachedFreeListSize;
         int allocated = allocatedSegments;
         int unallocated = maxSegments - allocated;
+        double utilization = (double) (allocated - free) / maxSegments * 100;
+        double allocation = (double) allocated / maxSegments * 100;
         return String
             .format(
-                "SecondaryPool[max=%d, allocated=%d, free=%d, unallocated=%d, utilization=%.1f%%, cleanup=enabled]",
+                "SecondaryPool[max=%d, allocated=%d, free=%d, unallocated=%d, utilization=%.1f%%, allocation=%.1f%%, cleanup=enabled]",
                 maxSegments,
                 allocated,
                 free,
                 unallocated,
-                (double) allocated / maxSegments * 100
+                utilization,
+                allocation
             );
     }
 

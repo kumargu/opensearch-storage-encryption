@@ -5,8 +5,7 @@
 package org.opensearch.index.store.block;
 
 import java.lang.foreign.MemorySegment;
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.VarHandle;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.logging.log4j.LogManager;
@@ -65,23 +64,12 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
     private final BlockReleaser<RefCountedMemorySegment> onFullyReleased;
 
     /**
-     * VarHandle for atomic CAS operations on the {@link #retired} field.
-     */
-    private static final VarHandle RETIRED;
-    static {
-        try {
-            RETIRED = MethodHandles.lookup().findVarHandle(RefCountedMemorySegment.class, "retired", boolean.class);
-        } catch (IllegalAccessException | NoSuchFieldException e) {
-            throw new Error(e);
-        }
-    }
-
-    /**
      * Retirement flag indicating this segment has been evicted from cache.
      * When true, {@link #tryPin()} will fail, preventing new readers from using stale data.
      * Existing pinned readers can continue using the segment until they unpin.
+     * Uses AtomicBoolean for thread-safe CAS operations.
      */
-    private volatile boolean retired = false;
+    private final AtomicBoolean retired = new AtomicBoolean(false);
 
     /**
      * Creates a reference-counted memory segment.
@@ -181,11 +169,11 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
     @Override
     public boolean tryPin() {
         try {
-            while (!this.retired) {
+            while (!this.retired.get()) {
                 int r = refCount.get();
                 if (r == 0) {
                     // Segment fully released but still in cache - should never happen
-                    LOGGER.error("tryPin FAILED: refCount=0 (segment released but still in cache), retired={}", this.retired);
+                    LOGGER.error("tryPin FAILED: refCount=0 (segment released but still in cache), retired={}", this.retired.get());
                     return false;
                 }
 
@@ -219,16 +207,16 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
 
     /**
      * Marks this segment as retired without decrementing the reference count.
-     * Called by the cache's evictionListener during the first phase of eviction.
+     * Uses CAS to ensure atomic retirement (only first caller succeeds).
      *
      * <p>This prevents new pins ({@link #tryPin()} will fail) while allowing existing
      * readers to continue safely until they unpin. The segment is only freed when
-     * refCount reaches 0 (after {@link #decRef()} in phase 2).
+     * refCount reaches 0 (after {@link #decRef()}).
      *
      * @return true if this call retired the segment, false if already retired
      */
     public boolean retire() {
-        return (boolean) RETIRED.compareAndSet(this, false, true);
+        return this.retired.compareAndSet(false, true);
     }
 
     /**
@@ -245,22 +233,22 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
      * </ul>
      */
     public void reset() {
-        this.retired = false;
+        this.retired.set(false);
         this.refCount.set(1);
     }
 
     /**
      * Closes this cache value by retiring it and dropping the cache's reference.
+     * Safe to call multiple times - only the first call will decRef.
      *
-     * <p><b>Called exactly once</b> by implementations NOT using two-phase eviction.
-     * If using two-phase eviction (evictionListener + removalListener), prefer calling
-     * {@link #retire()} and {@link #decRef()} separately.
-     *
-     * <p>This method combines both phases:
+     * <p>This method atomically:
      * <ol>
-     *   <li>Sets retired=true (prevents new pins)</li>
-     *   <li>Calls decRef() (drops cache's reference)</li>
+     *   <li>Sets retired=true via CAS (prevents new pins)</li>
+     *   <li>If CAS succeeds, calls decRef() (drops cache's reference)</li>
      * </ol>
+     *
+     * <p>The CAS ensures that even if close() is called multiple times,
+     * decRef() is only called once.
      */
     @Override
     public void close() {
@@ -290,6 +278,6 @@ public final class RefCountedMemorySegment implements BlockCacheValue<RefCounted
      */
     @Override
     public boolean isRetired() {
-        return this.retired;
+        return this.retired.get();
     }
 }

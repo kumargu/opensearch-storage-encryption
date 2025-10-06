@@ -4,6 +4,12 @@
  */
 package org.opensearch.index.store;
 
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_INITIAL_SIZE;
+import static org.opensearch.index.store.directio.DirectIoConfigs.READ_AHEAD_QUEUE_SIZE;
+import static org.opensearch.index.store.directio.DirectIoConfigs.RESEVERED_POOL_SIZE_IN_BYTES;
+import static org.opensearch.index.store.directio.DirectIoConfigs.WARM_UP_PERCENTAGE;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,11 +42,6 @@ import org.opensearch.index.store.block_cache.CaffeineBlockCache;
 import org.opensearch.index.store.block_loader.BlockLoader;
 import org.opensearch.index.store.block_loader.CryptoDirectIOBlockLoader;
 import org.opensearch.index.store.directio.CryptoDirectIODirectory;
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_INITIAL_SIZE;
-import static org.opensearch.index.store.directio.DirectIoConfigs.READ_AHEAD_QUEUE_SIZE;
-import static org.opensearch.index.store.directio.DirectIoConfigs.RESEVERED_POOL_SIZE_IN_BYTES;
-import static org.opensearch.index.store.directio.DirectIoConfigs.WARM_UP_PERCENTAGE;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
 import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
@@ -264,15 +265,15 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
      * - Uses double-checked locking for initialization
      * - Safe to call multiple times (idempotent)
      *
-     * Cache Eviction Strategy:
-     * - Two-phase eviction to prevent stale reads from BlockSlotTinyCache
-     * - Phase 1 (evictionListener): Sets retired=true to mark segment as stale
-     * - Phase 2 (removalListener): Calls decRef() to release cache's reference
+     * Cache Removal Strategy:
+     * - Uses removalListener to handle all removal causes (SIZE, EXPLICIT, REPLACED, etc.)
+     * - Calls value.close() which atomically: (1) sets retired=true, (2) calls decRef()
+     * - When refCount reaches 0, segment is returned to pool for reuse
      *
-     * Why separate listeners?
-     * - evictionListener fires during eviction (value might still be in cache momentarily)
-     * - Setting retired=true first prevents new pins while allowing existing readers to finish
-     * - removalListener fires after removal completes, safely releasing the reference
+     * Note on evictionListener vs removalListener:
+     * - evictionListener only fires for SIZE-based evictions
+     * - removalListener fires for ALL removals (including explicit invalidation)
+     * - We use removalListener to ensure retired flag is set for all removal paths
      */
     public static void initializeSharedPool() {
         if (sharedSegmentPool == null || sharedBlockCache == null) {
@@ -291,29 +292,21 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                         );
                     sharedSegmentPool.warmUp((long) (maxBlocks * WARM_UP_PERCENTAGE));
 
-                    // Initialize shared cache with two-phase eviction
+                    // Initialize shared cache with removal listener
                     Cache<BlockCacheKey, BlockCacheValue<RefCountedMemorySegment>> cache = Caffeine
                         .newBuilder()
                         .initialCapacity(CACHE_INITIAL_SIZE)
                         .recordStats()
                         .maximumSize(maxBlocks)
-                        .evictionListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, RemovalCause cause) -> {
-                            // Phase 1: Mark as retired to prevent new pins
-                            // This prevents BlockSlotTinyCache from serving stale data
-                            // Called synchronously during eviction (before value is fully removed from cache)
-                            if (value != null) {
-                                value.value().retire();
-                            }
-                        })
                         .removalListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, RemovalCause cause) -> {
-                            // Phase 2: Release the cache's reference (refCount decremented)
-                            // Called after value is fully removed from cache
+                            // Release cache's reference for all removal causes (SIZE, EXPLICIT, REPLACED, etc.)
+                            // close() atomically: (1) sets retired=true, (2) calls decRef()
                             // When refCount reaches 0, segment is returned to pool for reuse
                             if (value != null) {
                                 try {
-                                    value.value().decRef();
+                                    value.close();
                                 } catch (Throwable t) {
-                                    LOGGER.warn("Failed to decRef cached value during removal: key={}, cause={}", key, cause, t);
+                                    LOGGER.warn("Failed to close cached value during removal: key={}, cause={}", key, cause, t);
                                 }
                             }
                         })
