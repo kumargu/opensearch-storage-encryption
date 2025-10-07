@@ -8,8 +8,6 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.security.Provider;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.opensearch.common.crypto.MasterKeyProvider;
@@ -19,15 +17,13 @@ import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.store.iv.IndexKeyResolverRegistry;
 import org.opensearch.index.store.iv.KeyIvResolver;
+import org.opensearch.index.store.settings.CryptoIndexSettings;
 import org.opensearch.index.translog.CryptoTranslogFactory;
 
 /**
- * A factory that creates engines with crypto-enabled translogs for cryptofs indices.
+ * A factory that creates engines with crypto-enabled translogs
  */
 public class CryptoEngineFactory implements EngineFactory {
-
-    private static final Logger logger = LogManager.getLogger(CryptoEngineFactory.class);
-
     /**
      * Default constructor.
      */
@@ -66,7 +62,7 @@ public class CryptoEngineFactory implements EngineFactory {
         Path indexDirectory = translogPath.getParent().getParent(); // Go up two levels: translog -> shard -> index
 
         // Get the same settings that CryptoDirectoryFactory uses
-        Provider provider = config.getIndexSettings().getValue(CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING);
+        Provider provider = config.getIndexSettings().getValue(CryptoIndexSettings.INDEX_CRYPTO_PROVIDER_SETTING);
         MasterKeyProvider keyProvider = getKeyProvider(config);
 
         // Create directory for index-level keys (same as CryptoDirectoryFactory)

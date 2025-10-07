@@ -4,22 +4,14 @@
  */
 package org.opensearch.index.store;
 
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_INITIAL_SIZE;
-import static org.opensearch.index.store.directio.DirectIoConfigs.READ_AHEAD_QUEUE_SIZE;
-import static org.opensearch.index.store.directio.DirectIoConfigs.RESEVERED_POOL_SIZE_IN_BYTES;
-import static org.opensearch.index.store.directio.DirectIoConfigs.WARM_UP_PERCENTAGE;
-
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.Provider;
-import java.security.Security;
 import java.time.Duration;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -29,10 +21,7 @@ import org.apache.lucene.store.LockFactory;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.crypto.MasterKeyProvider;
-import org.opensearch.common.settings.Setting;
-import org.opensearch.common.settings.Setting.Property;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.settings.SettingsException;
 import org.opensearch.crypto.CryptoHandlerRegistry;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
@@ -45,6 +34,11 @@ import org.opensearch.index.store.block_cache.CaffeineBlockCache;
 import org.opensearch.index.store.block_loader.BlockLoader;
 import org.opensearch.index.store.block_loader.CryptoDirectIOBlockLoader;
 import org.opensearch.index.store.directio.CryptoDirectIODirectory;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_INITIAL_SIZE;
+import static org.opensearch.index.store.directio.DirectIoConfigs.READ_AHEAD_QUEUE_SIZE;
+import static org.opensearch.index.store.directio.DirectIoConfigs.RESEVERED_POOL_SIZE_IN_BYTES;
+import static org.opensearch.index.store.directio.DirectIoConfigs.WARM_UP_PERCENTAGE;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
 import org.opensearch.index.store.iv.IndexKeyResolverRegistry;
 import org.opensearch.index.store.iv.KeyIvResolver;
@@ -53,6 +47,9 @@ import org.opensearch.index.store.pool.MemorySegmentPool;
 import org.opensearch.index.store.pool.Pool;
 import org.opensearch.index.store.read_ahead.Worker;
 import org.opensearch.index.store.read_ahead.impl.QueuingWorker;
+import static org.opensearch.index.store.settings.CryptoIndexSettings.INDEX_CRYPTO_ENABLED_SETTING;
+import static org.opensearch.index.store.settings.CryptoIndexSettings.INDEX_CRYPTO_PROVIDER_SETTING;
+import static org.opensearch.index.store.settings.CryptoIndexSettings.INDEX_KMS_TYPE_SETTING;
 import org.opensearch.plugins.IndexStorePlugin;
 
 import com.github.benmanes.caffeine.cache.Cache;
@@ -62,11 +59,6 @@ import com.github.benmanes.caffeine.cache.RemovalCause;
 @SuppressForbidden(reason = "temporary")
 /**
  * Factory for creating encrypted filesystem directories with support for various storage types.
- *
- * Supports:
- * - NIOFS: NIO-based encrypted file system
- * - HYBRIDFS: Hybrid directory with Direct I/O and block caching
- * - MMAPFS: Not supported (throws AssertionError)
  *
  * The factory maintains node-level shared resources (pool and cache) for efficient
  * memory utilization across all encrypted directories.
@@ -99,48 +91,6 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         super();
     }
 
-    /**
-     * Specifies a crypto provider to be used for encryption. The default value
-     * is SunJCE.
-     */
-    public static final Setting<Provider> INDEX_CRYPTO_PROVIDER_SETTING = new Setting<>("index.store.crypto.provider", "SunJCE", (s) -> {
-        Provider p = Security.getProvider(s);
-        if (p == null) {
-            throw new SettingsException("unrecognized [index.store.crypto.provider] \"" + s + "\"");
-        } else {
-            return p;
-        }
-    }, Property.IndexScope, Property.InternalIndex);
-
-    /**
-     * Specifies the Key management plugin type to be used. The desired KMS
-     * plugin should be installed.
-     */
-    public static final Setting<String> INDEX_KMS_TYPE_SETTING = new Setting<>("index.store.kms.type", "", Function.identity(), (s) -> {
-        if (s == null || s.isEmpty()) {
-            throw new SettingsException("index.store.kms.type must be set");
-        }
-    }, Property.NodeScope, Property.IndexScope);
-
-    /**
-     * Specifies the node-level TTL for data keys in seconds. 
-     * Default is 3600 seconds (1 hour).
-     * Set to -1 to disable key refresh (keys are loaded once and cached forever).
-     * This setting applies globally to all indices.
-     */
-    public static final Setting<Integer> NODE_DATA_KEY_TTL_SECONDS_SETTING = Setting
-        .intSetting(
-            "node.store.data_key_ttl_seconds",
-            3600,  // default: 3600 seconds (1 hour)
-            -1,    // minimum: -1 means never refresh
-            (value) -> {
-                if (value != -1 && value < 1) {
-                    throw new IllegalArgumentException("node.store.data_key_ttl_seconds must be -1 (never refresh) or a positive value");
-                }
-            },
-            Property.NodeScope
-        );
-
     MasterKeyProvider getKeyProvider(IndexSettings indexSettings) {
         final String KEY_PROVIDER_TYPE = indexSettings.getValue(INDEX_KMS_TYPE_SETTING);
         final Settings settings = Settings.builder().put(indexSettings.getNodeSettings(), false).build();
@@ -165,6 +115,12 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
      */
     @Override
     public Directory newDirectory(IndexSettings indexSettings, ShardPath path) throws IOException {
+        // Check if encryption is enabled for this index
+        if (!indexSettings.getValue(INDEX_CRYPTO_ENABLED_SETTING)) {
+            // If encryption is not enabled, delegate to the default factory
+            return new FsDirectoryFactory().newDirectory(indexSettings, path);
+        }
+
         final Path location = path.resolveIndex();
         final LockFactory lockFactory = indexSettings.getValue(org.opensearch.index.store.FsDirectoryFactory.INDEX_LOCK_FACTOR_SETTING);
         Files.createDirectories(location);
@@ -182,25 +138,24 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
      */
     protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException {
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
-
-        // Use index-level key resolver - store keys at index level
-
         Path indexDirectory = location.getParent().getParent(); // Go up two levels: index -> shard -> index
         MasterKeyProvider keyProvider = getKeyProvider(indexSettings);
-
-        // Create a directory for the index-level keys
         Directory indexKeyDirectory = FSDirectory.open(indexDirectory);
-
-        // Use shared resolver registry to prevent race conditions
         String indexUuid = indexSettings.getIndex().getUUID();
         KeyIvResolver keyIvResolver = IndexKeyResolverRegistry.getOrCreateResolver(indexUuid, indexKeyDirectory, provider, keyProvider);
 
-        IndexModule.Type type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
+        final String storeType = indexSettings.getSettings()
+            .get(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), IndexModule.Type.FS.getSettingsKey());
+        IndexModule.Type type;
+        if (IndexModule.Type.FS.match(storeType)) {
+            type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
+        } else {
+            type = IndexModule.Type.fromSettingsKey(storeType);
+        }
 
         switch (type) {
-            case HYBRIDFS -> {
-                LOGGER.debug("Using HYBRIDFS directory with Direct I/O and block caching");
-
+            case HYBRIDFS, MMAPFS -> {
+                LOGGER.debug("Using HYBRIDFS directory");
                 CryptoDirectIODirectory cryptoDirectIODirectory = createCryptoDirectIODirectory(
                     location,
                     lockFactory,
@@ -208,9 +163,6 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                     keyIvResolver
                 );
                 return new HybridCryptoDirectory(lockFactory, cryptoDirectIODirectory, provider, keyIvResolver);
-            }
-            case MMAPFS -> {
-                throw new AssertionError("MMAPFS not supported with index level encryption");
             }
             case SIMPLEFS, NIOFS -> {
                 LOGGER.debug("Using NIOFS directory for encrypted storage");
@@ -337,7 +289,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                         .initialCapacity(CACHE_INITIAL_SIZE)
                         .recordStats()
                         .maximumSize(maxBlocks)
-                        .removalListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, RemovalCause cause) -> {
+                        .removalListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, @SuppressWarnings("unused") RemovalCause cause) -> {
                             if (value != null) {
                                 removalExec.execute(() -> {
                                     try {

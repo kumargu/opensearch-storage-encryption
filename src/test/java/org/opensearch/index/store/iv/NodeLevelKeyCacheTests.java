@@ -30,7 +30,7 @@ import org.junit.Test;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.index.store.CryptoDirectoryFactory;
+import org.opensearch.index.store.settings.CryptoNodeSettings;
 
 public class NodeLevelKeyCacheTests {
 
@@ -437,7 +437,7 @@ public class NodeLevelKeyCacheTests {
         Settings settings = Settings.builder().put("node.store.data_key_ttl_seconds", 0).build();
 
         try {
-            CryptoDirectoryFactory.NODE_DATA_KEY_TTL_SECONDS_SETTING.get(settings);
+            CryptoNodeSettings.NODE_DATA_KEY_TTL_SECONDS_SETTING.get(settings);
             fail("Expected IllegalArgumentException for invalid TTL value");
         } catch (IllegalArgumentException e) {
             assertTrue(e.getMessage().contains("must be -1 (never refresh) or a positive value"));
