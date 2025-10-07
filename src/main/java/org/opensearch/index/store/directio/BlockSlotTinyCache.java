@@ -4,8 +4,6 @@
  */
 package org.opensearch.index.store.directio;
 
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE_POWER;
-
 import java.io.IOException;
 import java.nio.file.Path;
 
@@ -13,6 +11,7 @@ import org.opensearch.index.store.block.RefCountedMemorySegment;
 import org.opensearch.index.store.block_cache.BlockCache;
 import org.opensearch.index.store.block_cache.BlockCacheValue;
 import org.opensearch.index.store.block_cache.FileBlockCacheKey;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE_POWER;
 
 /**
  * Fast L1 cache for recently accessed blocks.
@@ -36,8 +35,6 @@ import org.opensearch.index.store.block_cache.FileBlockCacheKey;
  * 3. Pool reuses segment for File B → RefCountedMemorySegment@X (gen=6, new data)
  * 4. Reader requests File A → L1 checks: cached gen(5) ≠ current gen(6) → reload
  *
- * Without generation checking, step 4 would return File B's data when File A was expected,
- * causing index corruption.
  */
 public final class BlockSlotTinyCache {
 
@@ -69,15 +66,11 @@ public final class BlockSlotTinyCache {
         final long blockIdx = blockOff >>> CACHE_BLOCK_SIZE_POWER;
 
         // Fast path: last accessed (avoid slot calculation if possible)
-        if (blockIdx == lastBlockIdx) {
-            BlockCacheValue<RefCountedMemorySegment> val = lastVal;
-            if (val != null) {
-                // Check generation to detect segment eviction or reuse
-                int currentGen = val.value().getGeneration();
-                if (currentGen == lastGeneration) {
-                    return val;
-                }
-                // Generation mismatch - segment was evicted/recycled, fall through to reload
+
+        if (blockIdx == lastBlockIdx && lastVal != null) {
+            RefCountedMemorySegment seg = lastVal.value();
+            if (seg.getGeneration() == lastGeneration) {
+                return lastVal;
             }
         }
 

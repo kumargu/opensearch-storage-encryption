@@ -4,18 +4,15 @@
  */
 package org.opensearch.index.store;
 
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_INITIAL_SIZE;
-import static org.opensearch.index.store.directio.DirectIoConfigs.READ_AHEAD_QUEUE_SIZE;
-import static org.opensearch.index.store.directio.DirectIoConfigs.RESEVERED_POOL_SIZE_IN_BYTES;
-import static org.opensearch.index.store.directio.DirectIoConfigs.WARM_UP_PERCENTAGE;
-
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.Provider;
 import java.security.Security;
 import java.time.Duration;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
@@ -42,6 +39,11 @@ import org.opensearch.index.store.block_cache.CaffeineBlockCache;
 import org.opensearch.index.store.block_loader.BlockLoader;
 import org.opensearch.index.store.block_loader.CryptoDirectIOBlockLoader;
 import org.opensearch.index.store.directio.CryptoDirectIODirectory;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_INITIAL_SIZE;
+import static org.opensearch.index.store.directio.DirectIoConfigs.READ_AHEAD_QUEUE_SIZE;
+import static org.opensearch.index.store.directio.DirectIoConfigs.RESEVERED_POOL_SIZE_IN_BYTES;
+import static org.opensearch.index.store.directio.DirectIoConfigs.WARM_UP_PERCENTAGE;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
 import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
@@ -292,6 +294,13 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                         );
                     sharedSegmentPool.warmUp((long) (maxBlocks * WARM_UP_PERCENTAGE));
 
+                    @SuppressWarnings("resource")
+                    ThreadPoolExecutor removalExec = new ThreadPoolExecutor(4, 8, 60L, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r -> {
+                        Thread t = new Thread(r, "block-cache-maint");
+                        t.setDaemon(true);
+                        return t;
+                    });
+
                     // Initialize shared cache with removal listener
                     Cache<BlockCacheKey, BlockCacheValue<RefCountedMemorySegment>> cache = Caffeine
                         .newBuilder()
@@ -299,15 +308,14 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                         .recordStats()
                         .maximumSize(maxBlocks)
                         .removalListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, RemovalCause cause) -> {
-                            // Release cache's reference for all removal causes (SIZE, EXPLICIT, REPLACED, etc.)
-                            // close() atomically: (1) sets retired=true, (2) calls decRef()
-                            // When refCount reaches 0, segment is returned to pool for reuse
                             if (value != null) {
-                                try {
-                                    value.close();
-                                } catch (Throwable t) {
-                                    LOGGER.warn("Failed to close cached value during removal: key={}, cause={}", key, cause, t);
-                                }
+                                removalExec.execute(() -> {
+                                    try {
+                                        value.close();
+                                    } catch (Throwable t) {
+                                        LOGGER.warn("Failed to close cached value during removal {}", key, t);
+                                    }
+                                });
                             }
                         })
                         .build();

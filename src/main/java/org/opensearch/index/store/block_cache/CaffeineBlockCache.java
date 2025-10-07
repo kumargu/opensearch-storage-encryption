@@ -4,8 +4,6 @@
  */
 package org.opensearch.index.store.block_cache;
 
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
-
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
@@ -16,6 +14,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.index.store.block_loader.BlockLoader;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
 import org.opensearch.index.store.pool.Pool;
 
 import com.github.benmanes.caffeine.cache.Cache;
@@ -64,7 +63,9 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
             BlockCacheValue<T> value = cache.get(key, k -> {
                 try {
                     V segment = blockLoader.load(k);
-                    return validateAndCast(segment);
+                    @SuppressWarnings("unchecked")
+                    BlockCacheValue<T> result = (BlockCacheValue<T>) segment;
+                    return result;
                 } catch (Exception e) {
                     return handleLoadException(k, e);
                 }
@@ -84,14 +85,22 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
 
     @Override
     public void prefetch(BlockCacheKey key) {
-        cache.asMap().computeIfAbsent(key, k -> {
-            try {
-                V segment = blockLoader.load(k);
-                return validateAndCast(segment);
-            } catch (Exception e) {
-                return handleLoadException(k, e);
-            }
-        });
+        try {
+            cache.get(key, k -> {
+                try {
+                    V segment = blockLoader.load(k);
+                    // Direct cast - BlockLoader contract guarantees V is BlockCacheValue<T>
+                    @SuppressWarnings("unchecked")
+                    BlockCacheValue<T> result = (BlockCacheValue<T>) segment;
+                    return result;
+                } catch (Exception e) {
+                    return handleLoadException(k, e);
+                }
+            });
+        } catch (Exception e) {
+            // Prefetch failures are non-fatal - log and continue
+            LOGGER.debug("Prefetch failed for key: {}", key, e);
+        }
     }
 
     @Override
@@ -147,18 +156,20 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
 
             for (int i = 0; i < loadedBlocks.length; i++) {
                 V block = loadedBlocks[i];
-                if (block == null) {
-                    throw new IOException("BlockLoader returned null at index " + i + " for path " + filePath);
-                }
 
                 long blockOffset = startOffset + i * CACHE_BLOCK_SIZE;
                 BlockCacheKey key = createBlockKey(filePath, blockOffset);
-                BlockCacheValue<T> wrapped = validateAndCast(block);
+
+                // Direct cast - BlockLoader contract guarantees V is BlockCacheValue<T>
+                @SuppressWarnings("unchecked")
+                BlockCacheValue<T> wrapped = (BlockCacheValue<T>) block;
                 loaded.put(key, wrapped);
 
                 if (cache.asMap().putIfAbsent(key, wrapped) != null) {
                     // already cached → release our newly loaded segment as we won't use it
-                    wrapped.close();
+                    // we use decRef() not close() - this segment was never inserted into cache,
+                    // so we shouldn't increment generation.
+                    wrapped.decRef();
                 }
             }
 
@@ -178,16 +189,6 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
     // Helper method to create appropriate cache key for file blocks
     private BlockCacheKey createBlockKey(Path filePath, long offset) {
         return new FileBlockCacheKey(filePath, offset);
-    }
-
-    @SuppressWarnings("unchecked")
-    private BlockCacheValue<T> validateAndCast(V loadedBlock) {
-        if (loadedBlock == null) {
-            throw new IllegalArgumentException("BlockLoader returned null segment");
-        }
-
-        // V is expected to be BlockCacheValue<T> (e.g., RefCountedMemorySegment)
-        return (BlockCacheValue<T>) loadedBlock;
     }
 
     private BlockCacheValue<T> handleLoadException(BlockCacheKey key, Exception e) {

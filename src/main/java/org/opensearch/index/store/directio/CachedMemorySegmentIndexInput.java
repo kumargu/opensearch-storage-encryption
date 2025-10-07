@@ -139,8 +139,11 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
         final long blockOffset = fileOffset & ~CACHE_BLOCK_MASK;
         final int offsetInBlock = (int) (fileOffset - blockOffset);
 
-        // Fast path: reuse current block if still valid
-        if (blockOffset == currentBlockOffset && currentBlock != null && !currentBlock.isRetired()) {
+        // Fast path: reuse current block if still valid.
+        // this access is safe without generation check because currentBlock
+        // is pinned (refCount > 1) so it cannot be returned to pool or reused
+        // for different data while we hold it.
+        if (blockOffset == currentBlockOffset && currentBlock != null) {
             lastOffsetInBlock = offsetInBlock;
             return currentBlock.value().segment();
         }
