@@ -47,10 +47,15 @@ For example:
 ```
  "index_settings": {
     "index.store.type": "cryptofs",
-    "index.store.kms.type": "aws-kms"
+    "index.store.crypto.key.type": "aws-kms",
+    "index.store.crypto.key": "arn:aws:kms:us-west-2:123456789012:key/12345678-1234-1234-1234-123456789012"
 }
 
 ```
+
+Settings:
+- `index.store.crypto.key.type`: The type of KMS provider (e.g., "aws-kms", "dummy")
+- `index.store.crypto.key`: The KMS key ID/ARN to use for encryption (optional, depends on KMS provider)
 
 ## Key announcement  
 

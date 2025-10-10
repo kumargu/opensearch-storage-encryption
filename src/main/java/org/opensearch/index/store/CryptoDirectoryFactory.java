@@ -92,11 +92,22 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     /**
      *  Specifies the Key management plugin type to be used. The desired KMS plugin should be installed.
      */
-    public static final Setting<String> INDEX_KMS_TYPE_SETTING = new Setting<>("index.store.kms.type", "", Function.identity(), (s) -> {
+    public static final Setting<String> INDEX_STORE_CRYPTO_KEY_TYPE_SETTING = new Setting<>("index.store.crypto.key.type", "", Function.identity(), (s) -> {
         if (s == null || s.isEmpty()) {
-            throw new SettingsException("index.store.kms.type must be set");
+            throw new SettingsException("index.store.crypto.key.type must be set");
         }
     }, Property.NodeScope, Property.IndexScope);
+
+    /**
+     * Specifies the KMS key ID/ARN to use for encryption.
+     * This key identifier will be passed to the KMS plugin for master key retrieval.
+     */
+    public static final Setting<String> INDEX_STORE_CRYPTO_KEY_SETTING = new Setting<>(
+        "index.store.crypto.key",
+        "",
+        Function.identity(),
+        Property.IndexScope
+    );
 
     /**
      * Specifies the node-level TTL for data keys in seconds. 
@@ -118,9 +129,10 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         );
 
     MasterKeyProvider getKeyProvider(IndexSettings indexSettings) {
-        final String KEY_PROVIDER_TYPE = indexSettings.getValue(INDEX_KMS_TYPE_SETTING);
+        final String KEY_PROVIDER_TYPE = indexSettings.getValue(INDEX_STORE_CRYPTO_KEY_TYPE_SETTING);
+        final String KMS_KEY_ID = indexSettings.getValue(INDEX_STORE_CRYPTO_KEY_SETTING);
         final Settings settings = Settings.builder().put(indexSettings.getNodeSettings(), false).build();
-        CryptoMetadata cryptoMetadata = new CryptoMetadata("", KEY_PROVIDER_TYPE, settings);
+        CryptoMetadata cryptoMetadata = new CryptoMetadata(KMS_KEY_ID, KEY_PROVIDER_TYPE, settings);
         MasterKeyProvider keyProvider;
         try {
             keyProvider = CryptoHandlerRegistry

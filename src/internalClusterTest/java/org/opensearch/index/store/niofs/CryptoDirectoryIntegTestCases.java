@@ -36,7 +36,7 @@ public class CryptoDirectoryIntegTestCases extends OpenSearchIntegTestCase {
             .builder()
             .put(super.indexSettings())
             .put("index.store.type", "cryptofs")
-            .put("index.store.kms.type", "dummy")
+            .put("index.store.crypto.key.type", "dummy")
             .build();
     }
 
@@ -70,7 +70,7 @@ public class CryptoDirectoryIntegTestCases extends OpenSearchIntegTestCase {
     // .builder()
     // .put(super.indexSettings())
     // .put("index.store.type", "cryptofs")
-    // .put("index.store.kms.type", "unavailable")
+    // .put("index.store.crypto.key.type", "unavailable")
     // .put(SETTING_NUMBER_OF_SHARDS, 1)
     // .put(SETTING_NUMBER_OF_REPLICAS, 0)
     // .build();
