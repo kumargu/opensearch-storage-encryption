@@ -42,18 +42,56 @@ public class ReadaheadManagerImpl implements ReadaheadManager {
     private final Worker worker;
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private ReadaheadContext context;
+    private final Thread processingThread;
 
     /**
      * Creates a new readahead manager that delegates prefetch operations to the specified worker.
-     * 
+     *
      * <p>The manager will use the provided worker to schedule and execute all readahead operations.
      * The worker should be properly configured and running before being passed to this constructor.
-     * 
+     *
+     * <p>A background thread is started to process pending access notifications asynchronously,
+     * keeping the hot path (block access) extremely fast.
+     *
      * @param worker the worker instance to handle readahead scheduling and execution
      * @throws NullPointerException if worker is null
      */
     public ReadaheadManagerImpl(Worker worker) {
         this.worker = worker;
+
+        // Start background thread to process access notifications
+        this.processingThread = new Thread(this::processAccessLoop, "readahead-access-processor");
+        this.processingThread.setDaemon(true);
+        this.processingThread.start();
+    }
+
+    /**
+     * Background thread loop that processes pending access notifications.
+     * Runs continuously until the manager is closed.
+     *
+     * <p>Uses park/unpark for low-latency event-driven wakeups instead of polling.
+     */
+    private void processAccessLoop() {
+        while (!closed.get()) {
+            try {
+                // Process pending access if context exists
+                ReadaheadContext ctx = this.context;
+                boolean processed = false;
+
+                if (ctx instanceof WindowedReadAheadContext) {
+                    WindowedReadAheadContext windowedCtx = (WindowedReadAheadContext) ctx;
+                    processed = windowedCtx.processPendingAccess();
+                }
+
+                if (!processed) {
+                    // No pending access - park until unparked by onAccess()
+                    // Use short timeout as fallback (200µs = 0.2ms) to avoid missing wakeups
+                    java.util.concurrent.locks.LockSupport.parkNanos(200_000L);
+                }
+            } catch (Exception e) {
+                LOGGER.warn("Error processing readahead access notification", e);
+            }
+        }
     }
 
     @Override
@@ -67,7 +105,8 @@ public class ReadaheadManagerImpl implements ReadaheadManager {
 
         WindowedReadAheadConfig config = WindowedReadAheadConfig.of(4, 16, 4, 50);
 
-        this.context = WindowedReadAheadContext.build(path, fileLength, worker, config);
+        // Pass processing thread reference for unpark notifications
+        this.context = WindowedReadAheadContext.build(path, fileLength, worker, config, processingThread);
 
         return this.context;
     }
@@ -109,11 +148,20 @@ public class ReadaheadManagerImpl implements ReadaheadManager {
     public void close() {
         if (closed.compareAndSet(false, true)) {
             try {
+                // Interrupt and wait for processing thread to stop
+                processingThread.interrupt();
+                try {
+                    processingThread.join(1000); // Wait up to 1 second
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+
+                // Close context
                 if (context != null) {
                     context.close();
                 }
             } catch (Exception e) {
-                LOGGER.warn("Error closing readahead context", e);
+                LOGGER.warn("Error closing readahead manager", e);
             }
         }
     }

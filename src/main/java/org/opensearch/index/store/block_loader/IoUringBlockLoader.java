@@ -28,16 +28,13 @@ import org.opensearch.index.store.pool.Pool;
  * A {@link BlockLoader} implementation that uses io_uring for asynchronous Direct I/O operations
  * with a registry of persistent file handles.
  *
- * <p>Similar to {@link CryptoDirectIOBlockLoader} but uses io_uring instead of FileChannel.
- * File handles are registered externally (by the directory) and looked up by path on each load.
- *
  * <p>Key features:
  * <ul>
- * <li>Registry-based file handles - maps paths to IoUringFile instances</li>
- * <li>Native async I/O via io_uring (Linux kernel 5.1+)</li>
- * <li>Direct I/O bypassing OS page cache</li>
- * <li>Automatic in-place decryption of loaded blocks</li>
- * <li>Memory pool integration for efficient buffer management</li>
+ *   <li>Registry-based file handles (shared across readers)</li>
+ *   <li>Native async I/O via io_uring</li>
+ *   <li>Direct I/O bypassing OS page cache</li>
+ *   <li>In-place decryption</li>
+ *   <li>Memory pool integration</li>
  * </ul>
  *
  * @opensearch.internal
@@ -49,17 +46,8 @@ public class IoUringBlockLoader implements BlockLoader<RefCountedMemorySegment> 
 
     private final Pool<RefCountedMemorySegment> segmentPool;
     private final KeyIvResolver keyIvResolver;
-
-    // Registry of open IoUringFile handles (shared reference from CryptoDirectIODirectory)
     private final ConcurrentHashMap<Path, IoUringFile> fileRegistry;
 
-    /**
-     * Constructs a new IoUringBlockLoader.
-     *
-     * @param segmentPool the memory segment pool for acquiring buffer space
-     * @param keyIvResolver the resolver for obtaining encryption keys and IVs
-     * @param fileRegistry shared registry from CryptoDirectIODirectory that maps paths to IoUringFile handles
-     */
     public IoUringBlockLoader(
         Pool<RefCountedMemorySegment> segmentPool,
         KeyIvResolver keyIvResolver,
@@ -72,43 +60,37 @@ public class IoUringBlockLoader implements BlockLoader<RefCountedMemorySegment> 
 
     @Override
     public RefCountedMemorySegment[] load(Path filePath, long startOffset, long blockCount) throws Exception {
-        if ((startOffset & CACHE_BLOCK_MASK) != 0) {
+        if ((startOffset & CACHE_BLOCK_MASK) != 0)
             throw new IllegalArgumentException("startOffset must be block-aligned: " + startOffset);
-        }
 
-        if (blockCount <= 0) {
+        if (blockCount <= 0)
             throw new IllegalArgumentException("blockCount must be positive: " + blockCount);
-        }
 
         Path normalized = filePath.toAbsolutePath().normalize();
         IoUringFile ioUringFile = fileRegistry.get(normalized);
-        if (ioUringFile == null) {
+        if (ioUringFile == null)
             throw new IOException("No io_uring file registered for path: " + normalized);
-        }
+
+        long readLength = blockCount << CACHE_BLOCK_SIZE_POWER;
+        if ((readLength & (DIRECT_IO_ALIGNMENT - 1)) != 0)
+            throw new IllegalArgumentException("readLength must be 512-byte aligned: " + readLength);
 
         RefCountedMemorySegment[] result = new RefCountedMemorySegment[(int) blockCount];
-        long readLength = blockCount << CACHE_BLOCK_SIZE_POWER;
 
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment readBuffer = arena.allocate(readLength, DIRECT_IO_ALIGNMENT);
 
-            // Submit async read via io_uring - uses the registered file handle
             CompletableFuture<Integer> readFuture = ioUringFile.readAsync(readBuffer.address(), (int) readLength, startOffset);
 
             Integer bytesReadObj = readFuture.join();
-            if (bytesReadObj == null) {
-                throw new RuntimeException("io_uring read returned null at offset " + startOffset);
-            }
-            long bytesRead = bytesReadObj.longValue();
+            if (bytesReadObj == null || bytesReadObj <= 0)
+                throw new IOException("EOF or failed read at offset " + startOffset);
 
-            if (bytesRead == 0) {
-                throw new RuntimeException("EOF or empty read at offset " + startOffset);
-            }
+            long bytesRead = bytesReadObj;
 
-            // Decrypt in-place
+            // In-place decryption
             MemorySegmentDecryptor
                 .decryptInPlace(
-                    arena,
                     readBuffer.address(),
                     bytesRead,
                     keyIvResolver.getDataKey().getEncoded(),
@@ -116,34 +98,7 @@ public class IoUringBlockLoader implements BlockLoader<RefCountedMemorySegment> 
                     startOffset
                 );
 
-            // Copy to pooled segments
-            int blockIndex = 0;
-            long bytesCopied = 0;
-
-            try {
-                while (blockIndex < blockCount && bytesCopied < bytesRead) {
-                    RefCountedMemorySegment handle = segmentPool.tryAcquire(10, TimeUnit.MILLISECONDS);
-                    if (handle == null) {
-                        throw new BlockLoader.PoolAcquireFailedException("Failed to acquire memory segment from pool after 10ms timeout");
-                    }
-
-                    MemorySegment pooled = handle.segment();
-                    int remaining = (int) (bytesRead - bytesCopied);
-                    int toCopy = Math.min(CACHE_BLOCK_SIZE, remaining);
-
-                    if (toCopy > 0) {
-                        MemorySegment.copy(readBuffer, bytesCopied, pooled, 0, toCopy);
-                    }
-
-                    result[blockIndex++] = handle;
-                    bytesCopied += toCopy;
-                }
-            } catch (InterruptedException e) {
-                releaseHandles(result, blockIndex);
-                Thread.currentThread().interrupt();
-                throw new BlockLoader.BlockLoadFailedException("Interrupted while acquiring pool segments", e);
-            }
-
+            copyToPool(readBuffer, bytesRead, result, blockCount);
             return result;
 
         } catch (Exception e) {
@@ -152,11 +107,83 @@ public class IoUringBlockLoader implements BlockLoader<RefCountedMemorySegment> 
         }
     }
 
-    private void releaseHandles(RefCountedMemorySegment[] handles, int upTo) {
-        for (int i = 0; i < upTo; i++) {
-            if (handles[i] != null) {
-                handles[i].close();
+    @Override
+    public CompletableFuture<RefCountedMemorySegment[]> loadAsync(Path filePath, long startOffset, long blockCount) {
+        if ((startOffset & CACHE_BLOCK_MASK) != 0)
+            return CompletableFuture.failedFuture(new IllegalArgumentException("startOffset must be block-aligned: " + startOffset));
+
+        if (blockCount <= 0)
+            return CompletableFuture.failedFuture(new IllegalArgumentException("blockCount must be positive: " + blockCount));
+
+        Path normalized = filePath.toAbsolutePath().normalize();
+        IoUringFile ioUringFile = fileRegistry.get(normalized);
+        if (ioUringFile == null)
+            return CompletableFuture.failedFuture(new IOException("No io_uring file registered for path: " + normalized));
+
+        long readLength = blockCount << CACHE_BLOCK_SIZE_POWER;
+        if ((readLength & (DIRECT_IO_ALIGNMENT - 1)) != 0)
+            return CompletableFuture.failedFuture(new IllegalArgumentException("readLength must be 512-byte aligned: " + readLength));
+
+        RefCountedMemorySegment[] result = new RefCountedMemorySegment[(int) blockCount];
+        // Use shared arena since it escapes the current thread scope (async completion)
+        Arena arena = Arena.ofShared();
+        MemorySegment readBuffer = arena.allocate(readLength, DIRECT_IO_ALIGNMENT);
+
+        CompletableFuture<Integer> readFuture = ioUringFile.readAsync(readBuffer.address(), (int) readLength, startOffset);
+
+        return readFuture.handle((bytesReadObj, ex) -> {
+            try (arena) {
+                if (ex != null)
+                    throw new IOException("io_uring read failed", ex);
+                if (bytesReadObj == null || bytesReadObj <= 0)
+                    throw new IOException("EOF or empty read at offset " + startOffset);
+
+                long bytesRead = bytesReadObj;
+
+                MemorySegmentDecryptor
+                    .decryptInPlace(
+                        readBuffer.address(),
+                        bytesRead,
+                        keyIvResolver.getDataKey().getEncoded(),
+                        keyIvResolver.getIvBytes(),
+                        startOffset
+                    );
+                copyToPool(readBuffer, bytesRead, result, blockCount);
+                return result;
+
+            } catch (Exception e2) {
+                LOGGER.error("io_uring async load failed: path={} offset={} blocks={}", normalized, startOffset, blockCount, e2);
+                throw new RuntimeException(e2);
             }
+        });
+    }
+
+    private void copyToPool(MemorySegment readBuffer, long bytesRead, RefCountedMemorySegment[] result, long blockCount) {
+        int blockIndex = 0;
+        long bytesCopied = 0;
+
+        try {
+            while (blockIndex < blockCount && bytesCopied < bytesRead) {
+                RefCountedMemorySegment handle = segmentPool.tryAcquire(10, TimeUnit.MILLISECONDS);
+                if (handle == null)
+                    throw new BlockLoader.PoolAcquireFailedException("Timeout acquiring memory segment from pool");
+
+                MemorySegment pooled = handle.segment();
+                int toCopy = (int) Math.min(CACHE_BLOCK_SIZE, bytesRead - bytesCopied);
+
+                MemorySegment.copy(readBuffer, bytesCopied, pooled, 0, toCopy);
+                result[blockIndex++] = handle;
+                bytesCopied += toCopy;
+            }
+        } catch (InterruptedException e) {
+            // Release already acquired segments
+            for (int i = 0; i < blockIndex; i++) {
+                if (result[i] != null) {
+                    result[i].close();
+                }
+            }
+            Thread.currentThread().interrupt();
+            throw new BlockLoader.BlockLoadFailedException("Interrupted while acquiring pool segments", e);
         }
     }
 }

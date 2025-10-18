@@ -117,16 +117,8 @@ public final class CryptoDirectIODirectory extends FSDirectory {
         Path file = getDirectory().resolve(name);
         long size = Files.size(file);
         if (size == 0) {
-            throw new IOException("Cannot open empty file with DirectIO: " + file);
+            throw new IOException("Cannot open empty file: " + file);
         }
-
-        IoUringFile ioUringFile = IoUringFile
-            .open(file.toFile(), this.ioEventLoopGroup.next(), IoUringFile.getDirectOpenOption(), StandardOpenOption.READ)
-            .join();
-
-        // Register in the shared registry (loader will look it up by path)
-        Path normalized = file.toAbsolutePath().normalize();
-        ioUringFileRegistry.put(normalized, ioUringFile);
 
         // Setup read-ahead
         ReadaheadManager readAheadManager = new ReadaheadManagerImpl(readAheadworker);
@@ -157,6 +149,12 @@ public final class CryptoDirectIODirectory extends FSDirectory {
         Path path = directory.resolve(name);
         OutputStream fos = Files.newOutputStream(path, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
 
+        IoUringFile ioUringFile = IoUringFile
+            .open(path.toFile(), this.ioEventLoopGroup.next(), IoUringFile.getDirectOpenOption(), StandardOpenOption.READ)
+            .join();
+        Path normalized = path.toAbsolutePath().normalize();
+        ioUringFileRegistry.put(normalized, ioUringFile);
+
         return new BufferIOWithCaching(
             name,
             path,
@@ -179,6 +177,14 @@ public final class CryptoDirectIODirectory extends FSDirectory {
         String name = getTempFileName(prefix, suffix, nextTempFileCounter.getAndIncrement());
         Path path = directory.resolve(name);
         OutputStream fos = Files.newOutputStream(path, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
+
+        IoUringFile ioUringFile = IoUringFile
+            .open(path.toFile(), this.ioEventLoopGroup.next(), IoUringFile.getDirectOpenOption(), StandardOpenOption.READ)
+            .join();
+
+        // Register in the shared registry (loader will look it up by path)
+        Path normalized = path.toAbsolutePath().normalize();
+        ioUringFileRegistry.put(normalized, ioUringFile);
 
         return new BufferIOWithCaching(
             name,

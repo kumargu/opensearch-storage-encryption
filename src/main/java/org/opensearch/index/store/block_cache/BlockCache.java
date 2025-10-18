@@ -7,6 +7,7 @@ package org.opensearch.index.store.block_cache;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Generic block cache interface for storing and retrieving blocks of data.
@@ -40,13 +41,6 @@ public interface BlockCache<T> {
     BlockCacheValue<T> getOrLoad(BlockCacheKey key) throws IOException;
 
     /**
-     * Asynchronously load the block into the cache if not present.
-     *
-     * @param key the cache key identifying the block to prefetch
-     */
-    void prefetch(BlockCacheKey key);
-
-    /**
      * Put a block into the cache.
      *
      * @param key the cache key for the block
@@ -76,7 +70,7 @@ public interface BlockCache<T> {
     /**
      * Bulk load multiple blocks efficiently using a single I/O operation.
      * Similar to getOrLoad() but for a contiguous range of blocks.
-     * 
+     *
      * @param filePath file to read from
      * @param startOffset starting file offset (should be block-aligned)
      * @param blockCount number of blocks to read
@@ -84,6 +78,27 @@ public interface BlockCache<T> {
      * @throws IOException if loading fails (including specific BlockLoader exceptions)
      */
     Map<BlockCacheKey, BlockCacheValue<T>> loadBulk(Path filePath, long startOffset, long blockCount) throws IOException;
+
+    /**
+     * Asynchronously bulk load multiple blocks for read-ahead purposes.
+     * Blocks are loaded into the cache asynchronously without blocking the caller.
+     *
+     * <p>The async operation chain:
+     * <ol>
+     * <li>Submit async read to I/O subsystem (e.g., io_uring)</li>
+     * <li>Decrypt data when read completes</li>
+     * <li>Populate cache with decrypted blocks</li>
+     * </ol>
+     *
+     * <p>The returned CompletableFuture completes when all blocks are loaded into cache.
+     * Callers can ignore the future for fire-and-forget behavior, or use it to track completion.
+     *
+     * @param filePath file to read from
+     * @param startOffset starting file offset (should be block-aligned)
+     * @param blockCount number of blocks to read
+     * @return CompletableFuture that completes when cache population finishes (successfully or with error)
+     */
+    CompletableFuture<Void> loadBulkAsync(Path filePath, long startOffset, long blockCount);
 
     /**
      * Returns cache statistics as a formatted string.

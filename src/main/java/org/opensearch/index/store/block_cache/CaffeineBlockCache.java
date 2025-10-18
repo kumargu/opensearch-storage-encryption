@@ -11,6 +11,7 @@ import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -93,26 +94,6 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
             throw e;
         } catch (RuntimeException e) {
             throw new IOException("Failed to load block for key: " + key, e);
-        }
-    }
-
-    @Override
-    public void prefetch(BlockCacheKey key) {
-        try {
-            cache.get(key, k -> {
-                try {
-                    V segment = blockLoader.load(k);
-                    // Direct cast - BlockLoader contract guarantees V is BlockCacheValue<T>
-                    @SuppressWarnings("unchecked")
-                    BlockCacheValue<T> result = (BlockCacheValue<T>) segment;
-                    return result;
-                } catch (Exception e) {
-                    return handleLoadException(k, e);
-                }
-            });
-        } catch (Exception e) {
-            // Prefetch failures are non-fatal - log and continue
-            LOGGER.debug("Prefetch failed for key: {}", key, e);
         }
     }
 
@@ -214,6 +195,82 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
             case RuntimeException rte -> throw rte;
             default -> throw new RuntimeException("Unexpected exception during block load for key: " + key, e);
         }
+    }
+
+    /**
+     * Asynchronously bulk load multiple blocks for read-ahead purposes.
+     * Blocks are loaded into the cache asynchronously without blocking the caller.
+     *
+     * <p>Uses the blockLoader's loadAsync() method. Implementations with true async I/O
+     * (like IoUringBlockLoader) will use non-blocking I/O, while others fall back to sync.
+     *
+     * @param filePath file to read from
+     * @param startOffset starting file offset (should be block-aligned)
+     * @param blockCount number of blocks to read
+     * @return CompletableFuture that completes when cache population finishes
+     */
+    @Override
+    public CompletableFuture<Void> loadBulkAsync(Path filePath, long startOffset, long blockCount) {
+        // Kick off async load via BlockLoader
+        return blockLoader.loadAsync(filePath, startOffset, blockCount).thenAccept(loadedBlocks -> {
+            if (loadedBlocks == null) {
+                throw new UncheckedIOException(
+                    new IOException(
+                        "BlockLoader returned null for async load: path=" + filePath + " off=" + startOffset + " blocks=" + blockCount
+                    )
+                );
+            }
+
+            int successfullyProcessed = 0;
+            int inserted = 0, skipped = 0;
+
+            try {
+                for (int i = 0; i < loadedBlocks.length; i++) {
+                    V segment = loadedBlocks[i];
+                    long blockOffset = startOffset + i * CACHE_BLOCK_SIZE;
+                    BlockCacheKey key = createBlockKey(filePath, blockOffset);
+
+                    @SuppressWarnings("unchecked")
+                    BlockCacheValue<T> wrapped = (BlockCacheValue<T>) segment;
+
+                    // Put into cache if absent; release duplicate
+                    if (cache.asMap().putIfAbsent(key, wrapped) == null) {
+                        inserted++;
+                    } else {
+                        wrapped.decRef();
+                        skipped++;
+                    }
+
+                    successfullyProcessed = i + 1;
+                }
+
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER
+                        .debug(
+                            "Async bulk load completed: path={} offset={} blocks={} inserted={} skipped={}",
+                            filePath,
+                            startOffset,
+                            blockCount,
+                            inserted,
+                            skipped
+                        );
+                }
+
+            } catch (Exception e) {
+                // Release any segments not yet inserted into cache
+                for (int j = successfullyProcessed; j < loadedBlocks.length; j++) {
+                    if (loadedBlocks[j] != null) {
+                        @SuppressWarnings("unchecked")
+                        BlockCacheValue<T> toRelease = (BlockCacheValue<T>) loadedBlocks[j];
+                        try {
+                            toRelease.decRef();
+                        } catch (Throwable ignore) {}
+                    }
+                }
+                LOGGER.warn("Exception during async bulk load cache population: path={} offset={}", filePath, startOffset, e);
+                throw e;
+            }
+        });
     }
 
     @Override

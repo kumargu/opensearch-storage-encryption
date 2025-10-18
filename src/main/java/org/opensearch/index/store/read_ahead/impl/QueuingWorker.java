@@ -6,14 +6,12 @@ package org.opensearch.index.store.read_ahead.impl;
 
 import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE_POWER;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.BlockingDeque;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -30,22 +28,22 @@ import org.opensearch.index.store.read_ahead.Worker;
 
 /**
  * Asynchronous readahead worker implementation with intelligent cache-aware block prefetching.
- * 
+ *
  * <p>This class provides sophisticated block prefetching capabilities designed to optimize sequential I/O performance
  * through proactive data loading. Key features include:
- * 
+ *
  * <ul>
  * <li><strong>Cache-aware scheduling:</strong> Analyzes existing cache coverage to avoid redundant I/O operations</li>
  * <li><strong>Gap consolidation:</strong> Merges nearby uncached regions to reduce I/O fragmentation and improve efficiency</li>
  * <li><strong>Deduplication:</strong> Prevents multiple in-flight requests for overlapping block ranges</li>
- * <li><strong>Multi-threaded processing:</strong> Utilizes configurable thread pool for concurrent block loading operations</li>
+ * <li><strong>Async I/O:</strong> Uses BlockCache.loadBulkAsync() for non-blocking I/O (e.g., io_uring)</li>
  * <li><strong>Bounded queue:</strong> Implements backpressure through capacity-limited request queue</li>
  * <li><strong>Path-based cancellation:</strong> Supports selective cancellation of pending requests by file path</li>
  * </ul>
- * 
- * <p>Thread safety is ensured through concurrent data structures and proper synchronization. The worker
- * maintains tracking of in-flight requests to prevent overlapping operations on the same block ranges.
- * 
+ *
+ * <p>Worker threads dequeue tasks and submit async load operations without blocking. Completion tracking
+ * ensures tasks remain in-flight until async operations finish, preventing duplicate work.
+ *
  * @opensearch.internal
  */
 public class QueuingWorker implements Worker {
@@ -245,9 +243,6 @@ public class QueuingWorker implements Worker {
         return true;
     }
 
-    /**
-     * Analyze cache coverage for a range and return uncached contiguous regions.
-     */
     private List<CacheGap> findUncachedRanges(Path path, long startOffset, long blockCount) {
         List<CacheGap> gaps = new ArrayList<>();
         long startBlockIndex = startOffset >>> CACHE_BLOCK_SIZE_POWER;
@@ -258,26 +253,23 @@ public class QueuingWorker implements Worker {
             long blockOffset = blockIndex << CACHE_BLOCK_SIZE_POWER;
             BlockCacheKey key = new FileBlockCacheKey(path, blockOffset);
 
-            if (blockCache.get(key) != null) {
+            boolean cached = (blockCache.get(key) != null);
+
+            if (!cached) {
                 if (currentGapStartIndex == -1) {
-                    // Start of new gap
-                    currentGapStartIndex = blockIndex;
+                    currentGapStartIndex = blockIndex;  // Start new gap on first uncached block
                 }
-                // Gap continues (no action needed)
             } else if (currentGapStartIndex != -1) {
-                // End of gap - record it
-                long gapBlocks = blockIndex - currentGapStartIndex;
+                long gapBlocks = blockIndex - currentGapStartIndex; // close gap
                 gaps.add(new CacheGap(currentGapStartIndex, gapBlocks));
                 currentGapStartIndex = -1;
             }
         }
 
-        // Handle final gap
         if (currentGapStartIndex != -1) {
             long gapBlocks = (startBlockIndex + blockCount) - currentGapStartIndex;
             gaps.add(new CacheGap(currentGapStartIndex, gapBlocks));
         }
-
         return gaps;
     }
 
@@ -327,30 +319,63 @@ public class QueuingWorker implements Worker {
         while (!closed) {
             try {
                 ReadAheadTask task = queue.takeFirst();
-
                 task.startNanos = System.nanoTime();
 
-                // bulk load the block.
-                blockCache.loadBulk(task.path, task.offset, task.blockCount);
-                task.doneNanos = System.nanoTime();
+                // Submit async bulk load and keep the in-flight marker until completion
+                CompletableFuture<Void> fut = blockCache.loadBulkAsync(task.path, task.offset, task.blockCount);
 
-                inFlight.remove(task);
+                final Path submittedPath = task.path;
+                final long submittedOffset = task.offset;
+                final long submittedBlocks = task.blockCount;
 
-                long blockStart = task.offset >>> CACHE_BLOCK_SIZE_POWER;
-                long blockEnd = blockStart + task.blockCount - 1;
-                LOGGER
-                    .debug(
-                        "RA_IO_DONE_BULK path={} blockRange=[{}-{}] off={} len={} blocks={} io_ms={} qsz={}/{}",
-                        task.path,
-                        blockStart,
-                        blockEnd,
-                        task.offset,
-                        task.blockCount << CACHE_BLOCK_SIZE_POWER,
-                        task.blockCount,
-                        (task.doneNanos - task.startNanos) / 1_000_000L,
-                        queue.size(),
-                        queueCapacity
-                    );
+                fut.whenComplete((ignored, ex) -> {
+                    task.doneNanos = System.nanoTime();
+                    inFlight.remove(task); // remove only after completion
+
+                    if (ex == null) {
+                        if (LOGGER.isDebugEnabled()) {
+                            long blockStart = submittedOffset >>> CACHE_BLOCK_SIZE_POWER;
+                            long blockEnd = blockStart + submittedBlocks - 1;
+                            long lenBytes = submittedBlocks << CACHE_BLOCK_SIZE_POWER;
+
+                            LOGGER
+                                .debug(
+                                    "RA_DONE  path={} blockRange=[{}-{}] off={} len={} blocks={} qsz={}/{} enq_to_submit_ms={} submit_to_done_ms={}",
+                                    submittedPath,
+                                    blockStart,
+                                    blockEnd,
+                                    submittedOffset,
+                                    lenBytes,
+                                    submittedBlocks,
+                                    queue.size(),
+                                    queueCapacity,
+                                    (task.startNanos - task.enqueuedNanos) / 1_000_000,
+                                    (task.doneNanos - task.startNanos) / 1_000_000
+                                );
+                        }
+                    } else {
+                        LOGGER.debug("RA_FAIL path={} off={} blocks={}", submittedPath, submittedOffset, submittedBlocks, ex);
+                    }
+                });
+
+                // Submitted: still in-flight until callback runs
+                if (LOGGER.isDebugEnabled()) {
+                    long blockStart = task.offset >>> CACHE_BLOCK_SIZE_POWER;
+                    long blockEnd = blockStart + task.blockCount - 1;
+                    LOGGER
+                        .debug(
+                            "RA_SUBMITTED path={} blockRange=[{}-{}] off={} len={} blocks={} qsz={}/{} submit_ns={}",
+                            task.path,
+                            blockStart,
+                            blockEnd,
+                            task.offset,
+                            task.blockCount << CACHE_BLOCK_SIZE_POWER,
+                            task.blockCount,
+                            queue.size(),
+                            queueCapacity,
+                            task.startNanos
+                        );
+                }
 
             } catch (InterruptedException ie) {
                 if (!closed) {
@@ -358,10 +383,9 @@ public class QueuingWorker implements Worker {
                 }
                 Thread.currentThread().interrupt();
                 return;
-            } catch (NoSuchFileException e) {
-                LOGGER.debug("File not found during readahead", e);
-            } catch (IOException | UncheckedIOException e) {
-                LOGGER.warn("Failed to prefetch", e);
+            } catch (Throwable t) {
+                // Defensive: don't let the worker die
+                LOGGER.warn("Readahead worker unexpected error in processLoop", t);
             }
         }
 

@@ -95,7 +95,8 @@ public interface BlockLoader<T> {
 
     /**
      * Load one or more blocks efficiently, returning raw memory segments.
-     * 
+     * This is a blocking/synchronous operation.
+     *
      * @param filePath file to read from
      * @param startOffset starting file offset (should be block-aligned)
      * @param blockCount number of blocks to read
@@ -103,6 +104,28 @@ public interface BlockLoader<T> {
      * @throws Exception if loading fails due to I/O errors, pool pressure, or other issues
      */
     T[] load(Path filePath, long startOffset, long blockCount) throws Exception;
+
+    /**
+     * Asynchronously load one or more blocks without blocking.
+     * Returns a CompletableFuture that completes with the loaded segments.
+     *
+     * <p>Default implementation delegates to the blocking {@link #load(Path, long, long)} method,
+     * but implementations using async I/O (like io_uring) should override this to provide
+     * true non-blocking behavior.
+     *
+     * @param filePath file to read from
+     * @param startOffset starting file offset (should be block-aligned)
+     * @param blockCount number of blocks to read
+     * @return CompletableFuture that completes with array of loaded memory segments
+     */
+    default java.util.concurrent.CompletableFuture<T[]> loadAsync(Path filePath, long startOffset, long blockCount) {
+        try {
+            T[] result = load(filePath, startOffset, blockCount);
+            return java.util.concurrent.CompletableFuture.completedFuture(result);
+        } catch (Exception e) {
+            return java.util.concurrent.CompletableFuture.failedFuture(e);
+        }
+    }
 
     /**
      * Loads a single block using the provided cache key.

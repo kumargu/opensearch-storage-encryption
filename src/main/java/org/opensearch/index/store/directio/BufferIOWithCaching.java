@@ -265,8 +265,8 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
                 // this will also flush the buffer.
                 super.close();
 
-                // After file is complete, load final block (footer) into cache for immediate reads
-                loadFinalBlocksIntoCache();
+                // After file is complete, load final block (footer) into cache asynchronously
+                loadFinalBlocksIntoCacheAsync();
 
                 // signal the kernel to flush the file cacehe
                 // we don't call flush aggresevley to avoid cpu pressure.
@@ -286,18 +286,20 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
                 throw exception;
         }
 
-        private void loadFinalBlocksIntoCache() {
-            try {
-                if (streamOffset <= 0)
-                    return;
+        private void loadFinalBlocksIntoCacheAsync() {
+            if (streamOffset <= 0)
+                return;
 
-                long finalBlockOffset = (streamOffset - 1) & ~CACHE_BLOCK_MASK;
-                BlockCacheKey blockKey = new FileBlockCacheKey(path, finalBlockOffset);
-                blockCache.getOrLoad(blockKey);
+            long finalBlockOffset = (streamOffset - 1) & ~CACHE_BLOCK_MASK;
 
-            } catch (IOException e) {
-                LOGGER.debug("Failed to load final block into cache for path={}: {}", path, e.toString());
-            }
+            // Use async bulk load for single block (non-blocking io_uring)
+            blockCache.loadBulkAsync(path, finalBlockOffset, 1).whenCompleteAsync((result, throwable) -> {
+                if (throwable != null) {
+                    LOGGER.warn("Failed async load of final block into cache for {}: {}", path, throwable.toString());
+                } else  {
+                    LOGGER.debug("Async loaded final block into cache: path={} offset={}", path, finalBlockOffset);
+                }
+            });
         }
 
         private void checkClosed() throws IOException {

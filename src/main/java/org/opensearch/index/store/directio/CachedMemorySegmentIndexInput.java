@@ -25,6 +25,7 @@ import org.opensearch.index.store.block.RefCountedMemorySegment;
 import org.opensearch.index.store.block_cache.BlockCache;
 import org.opensearch.index.store.block_cache.BlockCacheValue;
 import org.opensearch.index.store.block_cache.FileBlockCacheKey;
+import org.opensearch.index.store.directio.CachedMemorySegmentIndexInput.MultiSegmentImpl;
 import org.opensearch.index.store.read_ahead.ReadaheadContext;
 import org.opensearch.index.store.read_ahead.ReadaheadManager;
 
@@ -169,59 +170,59 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
         final long blockOffset = fileOffset & ~CACHE_BLOCK_MASK;
         final int offsetInBlock = (int) (fileOffset - blockOffset);
 
-        // Fast path: reuse current block if still valid.
-        // this access is safe without generation check because currentBlock
-        // is pinned (refCount > 1) so it cannot be returned to pool or reused
-        // for different data while we hold it.
-        if (blockOffset == currentBlockOffset && currentBlock != null) {
+        // same-block fast path (no readahead signal)
+        if (currentBlock != null && blockOffset == currentBlockOffset) {
             lastOffsetInBlock = offsetInBlock;
             return currentBlock.value().segment();
         }
 
         final int maxAttempts = 3;
         BlockCacheValue<RefCountedMemorySegment> cacheValue = null;
+        boolean wasCacheHit = false;
 
-        for (int attempts = 0; attempts < maxAttempts; attempts++) {
-            // First attempt via PinRegistry, retries via cache loader
-            cacheValue = (attempts == 0)
-                ? blockSlotTinyCache.acquireRefCountedValue(blockOffset)
-                : blockCache.getOrLoad(new FileBlockCacheKey(path, blockOffset));
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            if (attempt == 0) {
+                // L1 cache attempt - no key allocation needed
+                cacheValue = blockSlotTinyCache.acquireRefCountedValue(blockOffset);
+                wasCacheHit = (cacheValue != null);
+            } else {
+                // L2 cache attempt - create key only when needed
+                FileBlockCacheKey key = new FileBlockCacheKey(path, blockOffset);
+                final boolean existedBefore = (blockCache.get(key) != null);
+                cacheValue = blockCache.getOrLoad(key);
+                wasCacheHit = existedBefore;
+            }
 
             if (cacheValue != null && cacheValue.tryPin()) {
                 // Successfully pinned
                 break;
             }
 
-            if (attempts == maxAttempts - 1) {
-                throw new IOException(
-                    "Unable to pin memory segment for block at offset " + blockOffset + " after " + maxAttempts + " attempts"
-                );
+            if (attempt == maxAttempts - 1) {
+                throw new IOException("Unable to pin block @ " + blockOffset + " after " + maxAttempts + " attempts");
             }
 
-            // Brief backoff to allow eviction race to resolve
-            LockSupport.parkNanos(10_000L); // ~10µs
+            LockSupport.parkNanos(10_000L); // ~10µs backoff
         }
 
         if (cacheValue == null) {
-            throw new IOException("Failed to acquire cache value for block at offset " + blockOffset);
+            throw new IOException("Failed to acquire cache value for block @ " + blockOffset);
         }
 
-        RefCountedMemorySegment pinnedBlock = cacheValue.value();
+        // install new block, unpin old
+        final BlockCacheValue<RefCountedMemorySegment> prev = this.currentBlock;
+        this.currentBlockOffset = blockOffset;
+        this.currentBlock = cacheValue;
+        if (prev != null)
+            prev.unpin();
 
-        // Swap in new block, unpin old
-        if (currentBlock != null) {
-            currentBlock.unpin();
+        // notify readahead (single atomic store + unpark downstream)
+        if (readaheadContext != null) {
+            readaheadContext.onAccess(blockOffset, wasCacheHit);
         }
-        currentBlockOffset = blockOffset;
-        currentBlock = cacheValue;
-
-        // Notify readahead manager (if needed)
-        // if (readaheadManager != null && readaheadContext != null) {
-        // readaheadManager.onCacheMiss(readaheadContext, blockOffset);
-        // }
 
         lastOffsetInBlock = offsetInBlock;
-        return pinnedBlock.segment();
+        return cacheValue.value().segment();
     }
 
     @Override
@@ -279,7 +280,6 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
         } catch (IndexOutOfBoundsException ioobe) {
             throw handlePositionalIOOBE(ioobe, "read", startPos);
         } catch (NullPointerException | IllegalStateException e) {
-            LOGGER.error("=====Hit an error {}=====", e);
             throw alreadyClosed(e);
         }
     }
