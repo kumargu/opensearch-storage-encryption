@@ -33,7 +33,7 @@ import org.opensearch.index.store.block.RefCountedMemorySegment;
 import org.opensearch.index.store.block_cache.BlockCache;
 import org.opensearch.index.store.block_cache.CaffeineBlockCache;
 import org.opensearch.index.store.block_loader.BlockLoader;
-import org.opensearch.index.store.block_loader.CryptoDirectIOBlockLoader;
+import org.opensearch.index.store.block_loader.IoUringBlockLoader;
 import org.opensearch.index.store.directio.CryptoDirectIODirectory;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
 import org.opensearch.index.store.iv.IndexKeyResolverRegistry;
@@ -43,6 +43,10 @@ import org.opensearch.index.store.pool.PoolBuilder;
 import org.opensearch.index.store.read_ahead.Worker;
 import org.opensearch.index.store.read_ahead.impl.QueuingWorker;
 import org.opensearch.plugins.IndexStorePlugin;
+
+import io.netty.channel.IoEventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.uring.IoUringIoHandler;
 
 /**
  * Factory for creating encrypted filesystem directories with support for various storage types.
@@ -255,22 +259,18 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         * 5. Cache eviction: retired=true set (prevents new pins), then decRef() called
         * 6. refCount=0: Segment returned to pool for reuse
         *
-        * Two-Phase Eviction (prevents stale reads):
-        * -------------------------------------------
-        * - evictionListener: Sets retired=true (marks stale for BlockSlotTinyCache)
-        * - removalListener: Calls decRef() (releases cache's reference)
         */
+        int threads = Math.max(4, Runtime.getRuntime().availableProcessors() / 4);
+        IoEventLoopGroup ioEventLoopGroup = new MultiThreadIoEventLoopGroup(threads, IoUringIoHandler.newFactory());
 
-        // Create a per-directory loader that uses this directory's keyIvResolver for decryption
-        BlockLoader<RefCountedMemorySegment> loader = new CryptoDirectIOBlockLoader(poolResources.getSegmentPool(), keyIvResolver);
+        // Create shared io_uring file registry (shared between directory and loader)
+        java.util.concurrent.ConcurrentHashMap<Path, org.opensearch.index.store.async_io.IoUringFile> fileRegistry =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
-        // Cache architecture: One shared Caffeine cache storage, multiple wrapper instances
-        // - sharedBlockCache: Created once in initializeSharedPool(), holds the actual cache storage
-        // - directoryCache: Per-directory wrapper that shares the underlying cache but uses its own loader
-        // This design allows:
-        // * Shared cache capacity across all directories
-        // * Per-directory decryption via directory-specific loaders with unique keyIvResolvers
-        // * Unified eviction policy managed by the shared cache
+        // Create io_uring loader that uses the shared file registry
+        BlockLoader<RefCountedMemorySegment> loader = new IoUringBlockLoader(poolResources.getSegmentPool(), keyIvResolver, fileRegistry);
+
+        // Cache architecture: One shared Caffeine cache storage, with IoUringBlockLoader
         CaffeineBlockCache<RefCountedMemorySegment, RefCountedMemorySegment> sharedCaffeineCache =
             (CaffeineBlockCache<RefCountedMemorySegment, RefCountedMemorySegment>) poolResources.getBlockCache();
 
@@ -280,8 +280,6 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
             poolResources.getMaxCacheBlocks()
         );
 
-        // Create read-ahead worker for asynchronous prefetching
-        int threads = Math.max(4, Runtime.getRuntime().availableProcessors() / 4);
         Worker readaheadWorker = new QueuingWorker(READ_AHEAD_QUEUE_SIZE, threads, directoryCache);
 
         return new CryptoDirectIODirectory(
@@ -291,8 +289,9 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
             keyIvResolver,
             poolResources.getSegmentPool(),
             directoryCache,
-            loader,
-            readaheadWorker
+            readaheadWorker,
+            ioEventLoopGroup,
+            fileRegistry  // Pass the shared registry
         );
     }
 

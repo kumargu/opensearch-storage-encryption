@@ -247,8 +247,27 @@ public class IoUringFile implements AutoCloseable {
     }
 
     /**
+     * Reads data asynchronously from the file at the specified offset using io_uring.
+     *
+     * @param memoryAddress the native memory address where data will be read into
+     * @param length the number of bytes to read (returns completed future with 0 if length is 0)
+     * @param offset the file offset to read data from
+     * @return CompletableFuture that completes with number of bytes read
+     * @throws IllegalStateException if file is closed or ioRegistration is invalid
+     */
+    public CompletableFuture<Integer> readAsync(long memoryAddress, int length, long offset) {
+        allowSubmit();
+
+        if (length == 0) {
+            return CompletableFuture.completedFuture(0);
+        }
+
+        return ioUringIoHandle.readAsync(memoryAddress, length, offset, fd);
+    }
+
+    /**
      * Writes data asynchronously to the file at the specified offset using io_uring.
-     * 
+     *
      * @param memoryAddress the native memory address containing data to write
      * @param length the number of bytes to write (returns completed future with 0 if length is 0)
      * @param offset the file offset to write data to
@@ -439,6 +458,57 @@ public class IoUringFile implements AutoCloseable {
             return openFuture;
         }
 
+        private CompletableFuture<Integer> readAsync(long memoryAddress, int length, long offset, int fd) {
+            CompletableFuture<Integer> readFuture = new CompletableFuture<>();
+            if (ioEventLoop.inEventLoop()) {
+                submitRead(memoryAddress, length, offset, fd, readFuture);
+            } else {
+                ioEventLoop.execute(() -> { submitRead(memoryAddress, length, offset, fd, readFuture); });
+            }
+            return readFuture;
+        }
+
+        private void submitRead(long memoryAddress, int length, long offset, int fd, CompletableFuture<Integer> promise) {
+            assert ioEventLoop.inEventLoop();
+
+            AsyncOpContext ctx = new AsyncOpContext(promise, Constant.IORING_OP_READ);
+
+            // Find unique ID with wrap-around protection
+            short id;
+            do {
+                id = this.readId++;
+                if (readId == Short.MAX_VALUE) {
+                    readId = Short.MIN_VALUE;
+                }
+            } while (readFutures.containsKey(id));
+
+            readFutures.put(id, ctx);
+
+            IoUringIoOps ioOps = new IoUringIoOps(
+                Constant.IORING_OP_READ,
+                (byte) 0,
+                (short) 0,
+                fd,
+                offset,
+                memoryAddress,
+                length,
+                0,
+                id,
+                (short) 0,
+                (short) 0,
+                0,
+                0L
+            );
+
+            long uringId = registration.submit(ioOps);
+            if (uringId == -1) {
+                readFutures.remove(id);  // Cleanup on failure
+                promise.completeExceptionally(new IOException("submit read failed"));
+            } else {
+                ctx.uringId = uringId;
+            }
+        }
+
         private CompletableFuture<Integer> writeAsync(long memoryAddress, int length, long offset, int fd) {
             CompletableFuture<Integer> writeFuture = new CompletableFuture<>();
             if (ioEventLoop.inEventLoop()) {
@@ -451,37 +521,42 @@ public class IoUringFile implements AutoCloseable {
 
         private void submitWrite(long memoryAddress, int length, long offset, int fd, CompletableFuture<Integer> promise) {
             assert ioEventLoop.inEventLoop();
-            IoUringIoOps ioOps = null;
-            AsyncOpContext context = new AsyncOpContext(promise, Constant.IORING_OP_WRITE);
-            while (true) {
-                short writeId = this.writeId;
-                this.writeId = (short) (writeId + 1);
-                if (writeFutures.containsKey(writeId)) {
-                    continue;
+
+            AsyncOpContext ctx = new AsyncOpContext(promise, Constant.IORING_OP_WRITE);
+
+            // Find unique ID with wrap-around protection
+            short id;
+            do {
+                id = this.writeId++;
+                if (writeId == Short.MAX_VALUE) {
+                    writeId = Short.MIN_VALUE;
                 }
-                ioOps = new IoUringIoOps(
-                    Constant.IORING_OP_WRITE,
-                    (byte) 0,
-                    (short) 0,
-                    fd,
-                    offset,
-                    memoryAddress,
-                    length,
-                    0,
-                    writeId,
-                    (short) 0,
-                    (short) 0,
-                    0,
-                    0L
-                );
-                writeFutures.put(writeId, context);
-                break;
-            }
+            } while (writeFutures.containsKey(id));
+
+            writeFutures.put(id, ctx);
+
+            IoUringIoOps ioOps = new IoUringIoOps(
+                Constant.IORING_OP_WRITE,
+                (byte) 0,
+                (short) 0,
+                fd,
+                offset,
+                memoryAddress,
+                length,
+                0,
+                id,
+                (short) 0,
+                (short) 0,
+                0,
+                0L
+            );
+
             long uringId = registration.submit(ioOps);
             if (uringId == -1) {
+                writeFutures.remove(id);  // Cleanup on failure
                 promise.completeExceptionally(new IOException("submit write failed"));
             } else {
-                context.uringId = uringId;
+                ctx.uringId = uringId;
             }
         }
 
@@ -515,9 +590,18 @@ public class IoUringFile implements AutoCloseable {
                 this.otherFutures = new IntObjectHashMap<>();
             }
 
-            short id = this.otherId++;
-            AsyncOpContext context = new AsyncOpContext(promise, Constant.IORING_OP_FTRUNCATE);
-            otherFutures.put(id, context);
+            AsyncOpContext ctx = new AsyncOpContext(promise, Constant.IORING_OP_FTRUNCATE);
+
+            // Find unique ID with wrap-around protection
+            short id;
+            do {
+                id = this.otherId++;
+                if (otherId == Short.MAX_VALUE) {
+                    otherId = Short.MIN_VALUE;
+                }
+            } while (otherFutures.containsKey(id));
+
+            otherFutures.put(id, ctx);
 
             IoUringIoOps ioOps = new IoUringIoOps(
                 Constant.IORING_OP_FTRUNCATE,
@@ -537,67 +621,57 @@ public class IoUringFile implements AutoCloseable {
 
             long uringId = registration.submit(ioOps);
             if (uringId == -1) {
+                otherFutures.remove(id);  // Cleanup on failure
                 promise.completeExceptionally(new IOException("submitTruncate: submission failed"));
             } else {
-                context.uringId = uringId;
+                ctx.uringId = uringId;
             }
         }
 
         public void submitFsync(int fd, CompletableFuture<Integer> promise, boolean isSyncData, int len, long offset) {
             assert ioEventLoop.inEventLoop();
-            IntObjectHashMap<AsyncOpContext> otherFutures = this.otherFutures;
-            if (otherFutures == null) {
-                otherFutures = this.otherFutures = new IntObjectHashMap<>();
+
+            if (this.otherFutures == null) {
+                this.otherFutures = new IntObjectHashMap<>();
             }
-            IoUringIoOps ioOps = null;
-            AsyncOpContext context = new AsyncOpContext(promise, Constant.IORING_OP_FSYNC);
-            while (true) {
-                short otherId = this.otherId;
-                this.otherId = (short) (otherId + 1);
-                if (otherFutures.containsKey(otherId)) {
-                    continue;
+
+            AsyncOpContext ctx = new AsyncOpContext(promise, Constant.IORING_OP_FSYNC);
+
+            // Find unique ID with wrap-around protection
+            short id;
+            do {
+                id = this.otherId++;
+                if (otherId == Short.MAX_VALUE) {
+                    otherId = Short.MIN_VALUE;
                 }
-                if (isSyncData) {
-                    ioOps = new IoUringIoOps(
-                        Constant.IORING_OP_FSYNC,
-                        (byte) 0,
-                        (short) 0,
-                        fd,
-                        offset,
-                        0L,
-                        len,
-                        Constant.IORING_FSYNC_DATASYNC,
-                        otherId,
-                        (short) 0,
-                        (short) 0,
-                        0,
-                        0L
-                    );
-                } else {
-                    ioOps = new IoUringIoOps(
-                        Constant.IORING_OP_FSYNC,
-                        (byte) 0,
-                        (short) 0,
-                        fd,
-                        offset,
-                        0L,
-                        len,
-                        0,
-                        otherId,
-                        (short) 0,
-                        (short) 0,
-                        0,
-                        0L
-                    );
-                }
-                otherFutures.put(otherId, context);
-                break;
-            }
+            } while (otherFutures.containsKey(id));
+
+            otherFutures.put(id, ctx);
+
+            IoUringIoOps ioOps = isSyncData
+                ? new IoUringIoOps(
+                    Constant.IORING_OP_FSYNC,
+                    (byte) 0,
+                    (short) 0,
+                    fd,
+                    offset,
+                    0L,
+                    len,
+                    Constant.IORING_FSYNC_DATASYNC,
+                    id,
+                    (short) 0,
+                    (short) 0,
+                    0,
+                    0L
+                )
+                : new IoUringIoOps(Constant.IORING_OP_FSYNC, (byte) 0, (short) 0, fd, offset, 0L, len, 0, id, (short) 0, (short) 0, 0, 0L);
+
             long uringId = registration.submit(ioOps);
             if (uringId == -1) {
+                otherFutures.remove(id);  // Cleanup on failure
                 promise.completeExceptionally(new IOException("submit fsync failed"));
             } else {
-                context.uringId = uringId;
+                ctx.uringId = uringId;
             }
         }
 

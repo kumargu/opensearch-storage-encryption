@@ -13,6 +13,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.Provider;
+import java.time.Duration;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.logging.log4j.LogManager;
@@ -23,16 +25,19 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.LockFactory;
 import org.opensearch.common.SuppressForbidden;
+import org.opensearch.index.store.async_io.IoUringFile;
 import org.opensearch.index.store.block.RefCountedMemorySegment;
 import org.opensearch.index.store.block_cache.BlockCache;
+import org.opensearch.index.store.block_cache.CaffeineBlockCache;
 import org.opensearch.index.store.block_cache.FileBlockCacheKey;
-import org.opensearch.index.store.block_loader.BlockLoader;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.store.pool.Pool;
 import org.opensearch.index.store.read_ahead.ReadaheadContext;
 import org.opensearch.index.store.read_ahead.ReadaheadManager;
 import org.opensearch.index.store.read_ahead.Worker;
 import org.opensearch.index.store.read_ahead.impl.ReadaheadManagerImpl;
+
+import io.netty.channel.IoEventLoopGroup;
 
 /**
  * A high-performance FSDirectory implementation that combines Direct I/O operations with encryption.
@@ -65,18 +70,21 @@ public final class CryptoDirectIODirectory extends FSDirectory {
     private final BlockCache<RefCountedMemorySegment> blockCache;
     private final Worker readAheadworker;
     private final KeyIvResolver keyIvResolver;
+    private final IoEventLoopGroup ioEventLoopGroup;
+    private final ConcurrentHashMap<Path, IoUringFile> ioUringFileRegistry;
 
     /**
-     * Creates a new CryptoDirectIODirectory with the specified components.
-     * 
+     * Creates a new CryptoDirectIODirectory with io_uring support.
+     *
      * @param path the directory path
      * @param lockFactory the lock factory for coordinating access
-     * @param provider the security provider for cryptographic operations
+     * @param provider the security provider for cryptographic operations (unused, kept for compatibility)
      * @param keyIvResolver resolver for encryption keys and initialization vectors
      * @param memorySegmentPool pool for managing off-heap memory segments
-     * @param blockCache cache for storing decrypted blocks
-     * @param blockLoader loader for reading blocks from storage
+     * @param blockCache cache for storing decrypted blocks (must use IoUringBlockLoader)
      * @param worker background worker for read-ahead operations
+     * @param ioEventLoopGroup io_uring event loop group for lifecycle management
+     * @param ioUringFileRegistry shared registry mapping file paths to IoUringFile handles
      * @throws IOException if the directory cannot be created or accessed
      */
     public CryptoDirectIODirectory(
@@ -86,8 +94,9 @@ public final class CryptoDirectIODirectory extends FSDirectory {
         KeyIvResolver keyIvResolver,
         Pool<RefCountedMemorySegment> memorySegmentPool,
         BlockCache<RefCountedMemorySegment> blockCache,
-        BlockLoader<RefCountedMemorySegment> blockLoader,
-        Worker worker
+        Worker worker,
+        IoEventLoopGroup ioEventLoopGroup,
+        ConcurrentHashMap<Path, IoUringFile> ioUringFileRegistry
     )
         throws IOException {
         super(path, lockFactory);
@@ -95,6 +104,9 @@ public final class CryptoDirectIODirectory extends FSDirectory {
         this.memorySegmentPool = memorySegmentPool;
         this.blockCache = blockCache;
         this.readAheadworker = worker;
+        this.ioEventLoopGroup = ioEventLoopGroup;
+        this.ioUringFileRegistry = ioUringFileRegistry;
+        startCacheStatsTelemetry();
     }
 
     @Override
@@ -108,16 +120,27 @@ public final class CryptoDirectIODirectory extends FSDirectory {
             throw new IOException("Cannot open empty file with DirectIO: " + file);
         }
 
+        IoUringFile ioUringFile = IoUringFile
+            .open(file.toFile(), this.ioEventLoopGroup.next(), IoUringFile.getDirectOpenOption(), StandardOpenOption.READ)
+            .join();
+
+        // Register in the shared registry (loader will look it up by path)
+        Path normalized = file.toAbsolutePath().normalize();
+        ioUringFileRegistry.put(normalized, ioUringFile);
+
+        // Setup read-ahead
         ReadaheadManager readAheadManager = new ReadaheadManagerImpl(readAheadworker);
         ReadaheadContext readAheadContext = readAheadManager.register(file, size);
         BlockSlotTinyCache pinRegistry = new BlockSlotTinyCache(blockCache, file, size);
 
+        LOGGER.debug("Opened io_uring IndexInput: {}", file);
+
         return CachedMemorySegmentIndexInput
             .newInstance(
-                "CachedMemorySegmentIndexInput(path=\"" + file + "\")",
+                "IoUringIndexInput(path=\"" + file + "\")",
                 file,
                 size,
-                blockCache,
+                blockCache,  // Use the shared cache directly
                 readAheadManager,
                 readAheadContext,
                 pinRegistry
@@ -173,13 +196,54 @@ public final class CryptoDirectIODirectory extends FSDirectory {
     @Override
     @SuppressWarnings("ConvertToTryWithResources")
     public synchronized void close() throws IOException {
-        readAheadworker.close();
+        try {
+            readAheadworker.close();
+        } finally {
+            try {
+                // Close all io_uring file handles
+                for (var entry : ioUringFileRegistry.entrySet()) {
+                    try {
+                        entry.getValue().close();
+                        LOGGER.debug("Closed io_uring file: {}", entry.getKey());
+                    } catch (Exception e) {
+                        LOGGER.warn("Failed to close io_uring file: {}", entry.getKey(), e);
+                    }
+                }
+                ioUringFileRegistry.clear();
+            } finally {
+                // Shutdown io_uring event loop group
+                if (ioEventLoopGroup != null) {
+                    try {
+                        ioEventLoopGroup.shutdownGracefully().sync();
+                        LOGGER.debug("Shutdown io_uring event loop group");
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        LOGGER.warn("Interrupted while shutting down io_uring event loop group", e);
+                    } catch (Exception e) {
+                        LOGGER.warn("Failed to shutdown io_uring event loop group", e);
+                    }
+                }
+            }
+        }
     }
 
     @Override
     public void deleteFile(String name) throws IOException {
         Path file = getDirectory().resolve(name);
+        Path normalized = file.toAbsolutePath().normalize();
 
+        // Close and remove io_uring file handle if open
+        IoUringFile ioUringFile = ioUringFileRegistry.remove(normalized);
+        if (ioUringFile != null) {
+            try {
+                ioUringFile.close();
+                LOGGER.debug("Closed io_uring file on delete: {}", normalized);
+            } catch (Exception e) {
+                LOGGER.warn("Failed to close io_uring file on delete: {}", normalized, e);
+            }
+        }
+
+        // Invalidate cache entries
         if (blockCache != null) {
             try {
                 long fileSize = Files.size(file);
@@ -192,11 +256,43 @@ public final class CryptoDirectIODirectory extends FSDirectory {
                     }
                 }
             } catch (IOException e) {
-                // Fall back to path-based invalidation if file size unavailable
-                LOGGER.warn("Failed to get file size", e);
+                LOGGER.warn("Failed to get file size for cache invalidation", e);
             }
         }
 
         super.deleteFile(name);
+    }
+
+    private void logCacheAndPoolStats() {
+        try {
+
+            if (blockCache instanceof CaffeineBlockCache) {
+                String cacheStats = ((CaffeineBlockCache<?, ?>) blockCache).cacheStats();
+                LOGGER.info("{}", cacheStats);
+            }
+
+        } catch (Exception e) {
+            LOGGER.warn("Failed to log cache/pool stats", e);
+        }
+    }
+
+    private void startCacheStatsTelemetry() {
+        Thread loggerThread = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(Duration.ofMinutes(2));
+                    logCacheAndPoolStats();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (Throwable t) {
+                    LOGGER.warn("Error in collecting cache stats", t);
+                }
+            }
+        });
+
+        loggerThread.setDaemon(true);
+        loggerThread.setName("DirectIOBufferPoolStatsLogger");
+        loggerThread.start();
     }
 }
