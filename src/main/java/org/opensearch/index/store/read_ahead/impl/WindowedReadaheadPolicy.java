@@ -126,7 +126,8 @@ public final class WindowedReadaheadPolicy implements ReadaheadPolicy {
             } else {
                 // Backward seek → decay for small, reset for large
                 trigger = false;
-                newWin = (Math.abs(gap) > s.window / 2) ? initialWindow : decay(s.window);
+                long absGap = (gap == Long.MIN_VALUE) ? Long.MAX_VALUE : (gap < 0 ? -gap : gap);
+                newWin = (absGap > s.window / 2) ? initialWindow : decay(s.window);
             }
 
             final State next = new State(currSeg, currSeg + leadFor(newWin), newWin);
