@@ -51,6 +51,7 @@ public class WindowedReadAheadContext implements ReadaheadContext {
     private long missMaxBlock = -1;
 
     private volatile long lastSignalNanos = 0;
+    private volatile boolean signalPending = false;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     private static final VarHandle DESIRED_END_VH;
@@ -108,6 +109,9 @@ public class WindowedReadAheadContext implements ReadaheadContext {
     }
 
     private void handleCacheMiss(long currBlock) {
+        // Drain any pending signal from cache hits (off hot path)
+        drainSignalIfPending();
+
         consecutiveHits = 0;
         hitNopThreshold = HIT_NOP_THRESHOLD_BASE;
 
@@ -133,6 +137,8 @@ public class WindowedReadAheadContext implements ReadaheadContext {
         missCount = 0;
         missMaxBlock = -1;
         maybeSignal();
+        // Process immediately on miss (off hot path)
+        drainSignalIfPending();
     }
 
     /** Random or backward miss: cancel pending readahead */
@@ -217,7 +223,7 @@ public class WindowedReadAheadContext implements ReadaheadContext {
             return;
 
         final int w = Math.max(1, policy.currentWindow());
-        final int minBatch = Math.max(16, Math.max(policy.leadBlocks(), w / 2));
+        final int minBatch = Math.max(policy.initialWindow(), Math.max(policy.leadBlocks(), w / 2));
         if (delta < minBatch)
             return;
 
@@ -226,7 +232,14 @@ public class WindowedReadAheadContext implements ReadaheadContext {
             return;
 
         lastSignalNanos = now;
-        if (signalCallback != null) {
+
+        // Set flag instead of inline processing to avoid hot path latency
+        signalPending = true;
+    }
+
+    private void drainSignalIfPending() {
+        if (signalPending && signalCallback != null) {
+            signalPending = false;
             signalCallback.run();
         }
     }
