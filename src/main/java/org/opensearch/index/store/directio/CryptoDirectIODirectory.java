@@ -97,7 +97,7 @@ public final class CryptoDirectIODirectory extends FSDirectory {
         this.memorySegmentPool = memorySegmentPool;
         this.blockCache = blockCache;
         this.readAheadworker = worker;
-        startCacheStatsTelemetry();
+        // startCacheStatsTelemetry();
     }
 
     @Override

@@ -32,7 +32,6 @@ public class WindowedReadAheadContext implements ReadaheadContext {
     private final WindowedReadaheadPolicy policy;
     private final Runnable signalCallback;
 
-    // ---- Adaptive thresholds ----
     private static final int HIT_NOP_THRESHOLD_BASE = 8;
     private static final int HIT_NOP_THRESHOLD_MAX = 512;
     private int hitNopThreshold = HIT_NOP_THRESHOLD_BASE;
@@ -41,11 +40,9 @@ public class WindowedReadAheadContext implements ReadaheadContext {
     private static final long MIN_SIGNAL_INTERVAL_NS = 300_000L; // 300µs min signal interval
     private static final long MERGE_SPIN_NS = 60_000L;           // 60µs worker spin to coalesce
 
-    // ---- Shared state ----
     private volatile long desiredEndBlock = 0;
     private volatile long lastScheduledEndBlock = 0;
 
-    // ---- Reader-local, non-volatile ----
     private int consecutiveHits = 0;
     private int missCount = 0;
     private long missMaxBlock = -1;

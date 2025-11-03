@@ -19,7 +19,7 @@ import org.opensearch.index.store.read_ahead.ReadaheadPolicy;
  * Grows window exponentially on sequential access,
  * decays it gradually on random/backward access to avoid thrashing.
  */
-public final class WindowedReadaheadPolicy implements ReadaheadPolicy {
+public class WindowedReadaheadPolicy implements ReadaheadPolicy {
     private static final Logger LOGGER = LogManager.getLogger(WindowedReadaheadPolicy.class);
 
     private final Path path;
@@ -31,17 +31,15 @@ public final class WindowedReadaheadPolicy implements ReadaheadPolicy {
     /** Immutable state snapshot. */
     private static final class State {
         final long lastSeg;
-        final long markerSeg;
         final int window;
 
-        State(long lastSeg, long markerSeg, int window) {
+        State(long lastSeg, int window) {
             this.lastSeg = lastSeg;
-            this.markerSeg = markerSeg;
             this.window = window;
         }
 
         static State init(int initWin) {
-            return new State(-1L, -1L, initWin);
+            return new State(-1L, initWin);
         }
     }
 
@@ -88,9 +86,8 @@ public final class WindowedReadaheadPolicy implements ReadaheadPolicy {
             final State s = ref.get();
             if (s.lastSeg == -1L) {
                 final int win = initialWindow;
-                final long marker = currSeg + leadFor(win);
-                if (ref.compareAndSet(s, new State(currSeg, marker, win))) {
-                    LOGGER.trace("Init: path={}, currSeg={}, marker={}, win={}", path, currSeg, marker, win);
+                if (ref.compareAndSet(s, new State(currSeg, win))) {
+                    LOGGER.trace("Init: path={}, currSeg={}, win={}", path, currSeg, win);
                     return true;
                 }
                 continue;
@@ -130,7 +127,7 @@ public final class WindowedReadaheadPolicy implements ReadaheadPolicy {
                 newWin = (absGap > s.window / 2) ? initialWindow : decay(s.window);
             }
 
-            final State next = new State(currSeg, currSeg + leadFor(newWin), newWin);
+            final State next = new State(currSeg, newWin);
             if (ref.compareAndSet(s, next)) {
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER
@@ -154,18 +151,6 @@ public final class WindowedReadaheadPolicy implements ReadaheadPolicy {
     @Override
     public int currentWindow() {
         return ref.get().window;
-    }
-
-    /**
-     * Gets the current marker segment position.
-     * 
-     * <p>The marker represents the future position that will trigger the next readahead
-     * operation when crossed by sequential access patterns.
-     * 
-     * @return the current marker segment position, or -1 if not initialized
-     */
-    public long currentMarker() {
-        return ref.get().markerSeg;
     }
 
     /**
@@ -193,7 +178,7 @@ public final class WindowedReadaheadPolicy implements ReadaheadPolicy {
      * Called when the readahead queue is under moderate stress.
      */
     public void onQueuePressureMedium() {
-        ref.updateAndGet(s -> new State(s.lastSeg, s.markerSeg, Math.max(initialWindow, s.window >>> 1)));
+        ref.updateAndGet(s -> new State(s.lastSeg, Math.max(initialWindow, s.window >>> 1)));
     }
 
     /**
@@ -201,7 +186,7 @@ public final class WindowedReadaheadPolicy implements ReadaheadPolicy {
      * Called when the readahead queue is under severe stress.
      */
     public void onQueuePressureHigh() {
-        ref.updateAndGet(s -> new State(s.lastSeg, s.markerSeg, initialWindow));
+        ref.updateAndGet(s -> new State(s.lastSeg, initialWindow));
     }
 
     /**
@@ -217,7 +202,7 @@ public final class WindowedReadaheadPolicy implements ReadaheadPolicy {
      * This reduces unnecessary prefetching when the cache is already effective.
      */
     public void onCacheHitShrink() {
-        ref.updateAndGet(s -> new State(s.lastSeg, s.markerSeg, Math.max(initialWindow, s.window >>> 1)));
+        ref.updateAndGet(s -> new State(s.lastSeg, Math.max(initialWindow, s.window >>> 1)));
     }
 
     /**
