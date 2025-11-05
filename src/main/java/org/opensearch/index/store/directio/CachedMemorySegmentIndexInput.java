@@ -4,9 +4,6 @@
  */
 package org.opensearch.index.store.directio;
 
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_MASK;
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
-
 import java.io.EOFException;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -24,7 +21,8 @@ import org.apache.lucene.util.GroupVIntUtil;
 import org.opensearch.index.store.block.RefCountedMemorySegment;
 import org.opensearch.index.store.block_cache.BlockCache;
 import org.opensearch.index.store.block_cache.BlockCacheValue;
-import org.opensearch.index.store.directio.CachedMemorySegmentIndexInput.MultiSegmentImpl;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_MASK;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
 import org.opensearch.index.store.read_ahead.ReadaheadContext;
 import org.opensearch.index.store.read_ahead.ReadaheadManager;
 
@@ -99,11 +97,9 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
         ReadaheadContext readaheadContext,
         BlockSlotTinyCache blockSlotTinyCache
     ) {
-
-        return new MultiSegmentImpl(
+        CachedMemorySegmentIndexInput input = new CachedMemorySegmentIndexInput(
             resourceDescription,
             path,
-            0,
             0,
             length,
             blockCache,
@@ -112,6 +108,12 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
             false,
             blockSlotTinyCache
         );
+        try {
+            input.seek(0L);
+        } catch (IOException ioe) {
+            throw new AssertionError(ioe);
+        }
+        return input;
     }
 
     private CachedMemorySegmentIndexInput(
@@ -197,7 +199,7 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
                 throw new IOException("Unable to pin block @ " + blockOffset + " after " + maxAttempts + " attempts");
             }
 
-            LockSupport.parkNanos(10_000L); // ~10µs backoff
+            LockSupport.parkNanos(50_000L); // ~10µs backoff
         }
 
         if (cacheValue == null) {
@@ -629,36 +631,32 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
         return slice;
     }
 
-    /** Builds the actual sliced IndexInput (may apply extra offset in subclasses). * */
+    /** Builds the actual sliced IndexInput. * */
     CachedMemorySegmentIndexInput buildSlice(String sliceDescription, long sliceOffset, long length) {
         ensureOpen();
         // Calculate absolute base offset for the slice
         final long sliceAbsoluteBaseOffset = this.absoluteBaseOffset + sliceOffset;
-
-        LOGGER
-            .debug(
-                "BUILD_SLICE: desc={} sliceOffset={} length={} parentAbsBase={} sliceAbsBase={}",
-                sliceDescription,
-                sliceOffset,
-                length,
-                this.absoluteBaseOffset,
-                sliceAbsoluteBaseOffset
-            );
-
         final String newResourceDescription = getFullSliceDescription(sliceDescription);
 
-        return new MultiSegmentImpl(
+        CachedMemorySegmentIndexInput slice = new CachedMemorySegmentIndexInput(
             newResourceDescription,
             path,
-            0, // slice offset is always 0 (slice starts at its beginning)
             sliceAbsoluteBaseOffset,
             length,
             blockCache,
             readaheadManager,
             readaheadContext,
             true,
-            blockSlotTinyCache // reuse the same PinRegistry instance
+            blockSlotTinyCache
         );
+
+        try {
+            slice.seek(0L);
+        } catch (IOException ioe) {
+            throw new AssertionError(ioe);
+        }
+
+        return slice;
     }
 
     @Override
@@ -689,95 +687,6 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
         } else {
             // Assertions for slice instance
             assert isSlice : "Slice instance should be marked as slice";
-        }
-    }
-
-    /** This class adds offset support to MemorySegmentIndexInput, which is needed for slices. */
-    static final class MultiSegmentImpl extends CachedMemorySegmentIndexInput {
-        private final long offset;
-
-        MultiSegmentImpl(
-            String resourceDescription,
-            Path path,
-            long offset,
-            long absoluteBaseOffset,
-            long length,
-            BlockCache<RefCountedMemorySegment> blockCache,
-            ReadaheadManager readaheadManager,
-            ReadaheadContext readaheadContext,
-            boolean isSlice,
-            BlockSlotTinyCache blockSlotTinyCache
-        ) {
-            super(
-                resourceDescription,
-                path,
-                absoluteBaseOffset,
-                length,
-                blockCache,
-                readaheadManager,
-                readaheadContext,
-                isSlice,
-                blockSlotTinyCache
-            );
-            this.offset = offset;
-            try {
-                seek(0L);
-            } catch (IOException ioe) {
-                throw new AssertionError(ioe);
-            }
-            assert isOpen;
-        }
-
-        @Override
-        RuntimeException handlePositionalIOOBE(RuntimeException unused, String action, long pos) throws IOException {
-            return super.handlePositionalIOOBE(unused, action, pos - offset);
-        }
-
-        @Override
-        public void seek(long pos) throws IOException {
-            assert pos >= 0L : "negative position";
-            super.seek(pos + offset);
-        }
-
-        @Override
-        public long getFilePointer() {
-            return super.getFilePointer() - offset;
-        }
-
-        @Override
-        public byte readByte(long pos) throws IOException {
-            return super.readByte(pos + offset);
-        }
-
-        @Override
-        public short readShort(long pos) throws IOException {
-            return super.readShort(pos + offset);
-        }
-
-        @Override
-        public int readInt(long pos) throws IOException {
-            return super.readInt(pos + offset);
-        }
-
-        @Override
-        public long readLong(long pos) throws IOException {
-            return super.readLong(pos + offset);
-        }
-
-        @Override
-        CachedMemorySegmentIndexInput buildSlice(String sliceDescription, long ofs, long length) {
-            return super.buildSlice(sliceDescription, this.offset + ofs, length);
-        }
-
-        @Override
-        public long getAbsoluteFileOffset() {
-            return absoluteBaseOffset + getFilePointer();
-        }
-
-        @Override
-        public long getAbsoluteFileOffset(long pos) {
-            // pos is relative to the slice, we need to add offset
-            return absoluteBaseOffset + offset + pos;
         }
     }
 }
