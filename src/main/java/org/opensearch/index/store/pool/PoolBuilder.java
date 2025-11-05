@@ -4,6 +4,8 @@
  */
 package org.opensearch.index.store.pool;
 
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
+
 import java.io.Closeable;
 import java.time.Duration;
 import java.util.concurrent.ExecutorService;
@@ -16,7 +18,6 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.index.store.block.RefCountedMemorySegment;
 import org.opensearch.index.store.block_cache.BlockCache;
 import org.opensearch.index.store.block_cache.BlockCacheBuilder;
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE;
 
 /**
  * Builder for creating shared pool and cache resources with proper lifecycle management.

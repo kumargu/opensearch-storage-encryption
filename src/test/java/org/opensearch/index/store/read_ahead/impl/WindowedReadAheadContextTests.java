@@ -55,8 +55,6 @@ public class WindowedReadAheadContextTests extends OpenSearchTestCase {
         return WindowedReadAheadContext.build(TEST_PATH, fileLength, mockWorker, customConfig, mockSignalCallback);
     }
 
-    // ========== Basic Construction and Initialization Tests ==========
-
     /**
      * Tests that context can be created with valid parameters.
      */
@@ -177,8 +175,6 @@ public class WindowedReadAheadContextTests extends OpenSearchTestCase {
         assertNotNull("Context should remain valid", context);
     }
 
-    // ========== Cache Miss Handling Tests ==========
-
     /**
      * Tests single cache miss batching - should not immediately trigger.
      */
@@ -274,8 +270,6 @@ public class WindowedReadAheadContextTests extends OpenSearchTestCase {
         assertTrue("Far-ahead miss should queue work", context.hasQueuedWork());
     }
 
-    // ========== Random Access Detection Tests ==========
-
     /**
      * Tests backward access cancels pending readahead.
      */
@@ -310,8 +304,6 @@ public class WindowedReadAheadContextTests extends OpenSearchTestCase {
         // Random pattern may trigger some readahead but should be limited
         assertNotNull("Context should handle random access", context);
     }
-
-    // ========== Queue Processing Tests ==========
 
     /**
      * Tests processQueue returns false when no work queued.
@@ -557,8 +549,6 @@ public class WindowedReadAheadContextTests extends OpenSearchTestCase {
         verify(mockWorker, atLeastOnce()).cancel(TEST_PATH);
     }
 
-    // ========== Close Tests ==========
-
     /**
      * Tests close disables readahead and cancels work.
      */
@@ -604,8 +594,6 @@ public class WindowedReadAheadContextTests extends OpenSearchTestCase {
 
         assertFalse("processQueue should return false after close", processed);
     }
-
-    // ========== Concurrent Access Tests ==========
 
     /**
      * Tests concurrent onAccess calls from multiple threads.

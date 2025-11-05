@@ -4,20 +4,23 @@
  */
 package org.opensearch.index.store.read_ahead.impl;
 
-import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE_POWER;
-
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.Set;
-import java.util.concurrent.*;
+import java.util.concurrent.BlockingDeque;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.index.store.block.RefCountedMemorySegment;
 import org.opensearch.index.store.block_cache.BlockCache;
+import static org.opensearch.index.store.directio.DirectIoConfigs.CACHE_BLOCK_SIZE_POWER;
 import org.opensearch.index.store.read_ahead.Worker;
 
 /**
@@ -79,6 +82,7 @@ public final class QueuingWorker implements Worker {
 
     private static final int LARGE_WINDOW_THRESHOLD = 512;
     private static final int DUP_WARN_THRESHOLD = 10;
+    private static final int MAX_BULK_SIZE = 128; // Maximum blocks per I/O operation
 
     private final AtomicInteger duplicateCounter = new AtomicInteger();
     private final AtomicInteger activeRunners = new AtomicInteger(0);
@@ -110,6 +114,26 @@ public final class QueuingWorker implements Worker {
             return false;
         }
 
+        // Split large requests into chunks to avoid blocking executor threads.
+        if (blockCount > MAX_BULK_SIZE) {
+            boolean allAccepted = true;
+            for (long i = 0; i < blockCount; i += MAX_BULK_SIZE) {
+                long chunkSize = Math.min(MAX_BULK_SIZE, blockCount - i);
+                long chunkOffset = offset + (i << CACHE_BLOCK_SIZE_POWER);
+                if (!scheduleChunk(path, chunkOffset, chunkSize)) {
+                    allAccepted = false;
+                }
+            }
+            return allAccepted;
+        }
+
+        return scheduleChunk(path, offset, blockCount);
+    }
+
+    /**
+     * Internal method to schedule a single chunk (not exceeding MAX_BULK_SIZE).
+     */
+    private boolean scheduleChunk(Path path, long offset, long blockCount) {
         final long blockStart = offset >>> CACHE_BLOCK_SIZE_POWER;
         final long blockEnd = blockStart + blockCount;
 
@@ -294,6 +318,5 @@ public final class QueuingWorker implements Worker {
         closed = true;
         queue.clear();
         inFlight.clear();
-        LOGGER.info("Closed readahead worker qsz={} inflight={}", queue.size(), inFlight.size());
     }
 }

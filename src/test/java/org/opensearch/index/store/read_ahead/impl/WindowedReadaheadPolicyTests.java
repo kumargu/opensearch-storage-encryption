@@ -155,8 +155,6 @@ public class WindowedReadaheadPolicyTests extends OpenSearchTestCase {
         assertTrue("Lead should be at least 1", lead >= 1);
     }
 
-    // ========== Sequential Access Pattern Tests ==========
-
     /**
      * Tests sequential forward access pattern and window growth.
      * Note: Policy doesn't trigger on every access, but grows window when it does trigger.
@@ -435,8 +433,6 @@ public class WindowedReadaheadPolicyTests extends OpenSearchTestCase {
         assertTrue("Lead should be positive", lead4 > 0);
     }
 
-    // ========== Queue Pressure Tests ==========
-
     /**
      * Tests medium queue pressure shrinks window.
      */
@@ -525,8 +521,6 @@ public class WindowedReadaheadPolicyTests extends OpenSearchTestCase {
         assertEquals("Window should bottom at initial", 4, policy.currentWindow());
     }
 
-    // ========== Cache Hit Shrink Tests ==========
-
     /**
      * Tests cache hit shrink reduces window.
      */
@@ -561,8 +555,6 @@ public class WindowedReadaheadPolicyTests extends OpenSearchTestCase {
         policy.onCacheHitShrink();  // 4 -> 4 (bottomed)
         assertEquals("Window should stay at initial", 4, policy.currentWindow());
     }
-
-    // ========== Reset Tests ==========
 
     /**
      * Tests reset clears all state.
@@ -610,8 +602,6 @@ public class WindowedReadaheadPolicyTests extends OpenSearchTestCase {
 
         assertEquals("Window should remain initial", 4, policy.currentWindow());
     }
-
-    // ========== Concurrent Access Tests ==========
 
     /**
      * Tests concurrent shouldTrigger calls.
@@ -767,8 +757,6 @@ public class WindowedReadaheadPolicyTests extends OpenSearchTestCase {
         assertTrue("Should have some triggers", triggerCount.get() > 0);
     }
 
-    // ========== Complex Access Pattern Tests ==========
-
     /**
      * Tests alternating sequential and random access.
      */
@@ -831,8 +819,6 @@ public class WindowedReadaheadPolicyTests extends OpenSearchTestCase {
         // Should detect as non-sequential and not grow much
         assertNotNull("Policy should handle stride pattern", policy);
     }
-
-    // ========== Edge Cases ==========
 
     /**
      * Tests very large block indices.
