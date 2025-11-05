@@ -44,6 +44,9 @@ public class BlockSlotTinyCache {
 
     /**
      * Result of a cache lookup operation, containing the value and whether it was found in cache.
+     *
+     * @param value the cached block value
+     * @param wasCacheHit true if the value was found in cache, false otherwise
      */
     public record LookupResult(BlockCacheValue<RefCountedMemorySegment> value, boolean wasCacheHit) {
     }

@@ -45,10 +45,27 @@ public class WindowedReadaheadPolicy implements ReadaheadPolicy {
 
     private final AtomicReference<State> ref;
 
+    /**
+     * Creates a new WindowedReadaheadPolicy with the specified parameters.
+     *
+     * @param path the file path this policy applies to
+     * @param initialWindow the starting window size
+     * @param maxWindow the maximum window size
+     * @param smallGapDivisor the divisor for determining small forward jumps
+     */
     public WindowedReadaheadPolicy(Path path, int initialWindow, int maxWindow, int smallGapDivisor) {
         this(path, initialWindow, maxWindow, 1, smallGapDivisor);
     }
 
+    /**
+     * Creates a new WindowedReadaheadPolicy with full parameter control.
+     *
+     * @param path the file path this policy applies to
+     * @param initialWindow the starting window size (must be &gt;= 1)
+     * @param maxWindow the maximum window size (must be &gt;= initialWindow)
+     * @param minLead the minimum lead distance (must be &gt;= 1)
+     * @param smallGapDivisor the divisor for determining small forward jumps (must be &gt;= 2)
+     */
     public WindowedReadaheadPolicy(Path path, int initialWindow, int maxWindow, int minLead, int smallGapDivisor) {
         if (initialWindow < 1)
             throw new IllegalArgumentException("initialWindow must be >= 1");
