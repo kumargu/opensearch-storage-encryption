@@ -92,6 +92,13 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     public static final String CRYPTO_SETTING = "index.store.crypto";
 
     /**
+     * Boolean flag to enable encryption for an index.
+     * When true, the index will use encrypted directories regardless of store type.
+     */
+    public static final Setting<Boolean> INDEX_CRYPTO_ENABLED_SETTING = Setting
+        .boolSetting("index.store.crypto.enabled", false, Property.IndexScope, Property.Final);
+
+    /**
      * Specifies a crypto provider to be used for encryption. The default value
      * is SunJCE.
      */
@@ -202,6 +209,14 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
      */
     @Override
     public Directory newDirectory(IndexSettings indexSettings, ShardPath path) throws IOException {
+        // Check if encryption is enabled via the boolean flag
+        boolean cryptoEnabled = INDEX_CRYPTO_ENABLED_SETTING.get(indexSettings.getSettings());
+
+        if (!cryptoEnabled) {
+            // normal FS directory
+            return new FsDirectoryFactory().newDirectory(indexSettings, path);
+        }
+
         final Path location = path.resolveIndex();
         final LockFactory lockFactory = indexSettings.getValue(org.opensearch.index.store.FsDirectoryFactory.INDEX_LOCK_FACTOR_SETTING);
         Files.createDirectories(location);
@@ -210,20 +225,24 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     }
 
     /**
-     * Creates an encrypted directory based on the configured store type.
+     * Creates a directory based on the configured store type.
+     * If crypto.enabled is true or store type is "cryptofs", creates an encrypted directory.
+     * Otherwise, creates a standard directory.
      *
      * @param location the directory location
      * @param lockFactory the lock factory for this directory
      * @param indexSettings the index settings
-     * @return the concrete implementation of the encrypted directory based on store type
+     * @param shardId the shard ID
+     * @return the concrete implementation of the directory based on store type and encryption settings
      * @throws IOException if directory creation fails
      */
     protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings, int shardId)
         throws IOException {
+
+        // Create encrypted directory
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
 
         // Use index-level key resolver - store keys at index level
-
         Path indexDirectory = location.getParent().getParent(); // Go up two levels: index -> shard -> index
         MasterKeyProvider keyProvider = getKeyProvider(indexSettings);
 

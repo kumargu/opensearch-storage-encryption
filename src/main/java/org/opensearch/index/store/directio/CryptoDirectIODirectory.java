@@ -69,7 +69,6 @@ public class CryptoDirectIODirectory extends FSDirectory {
     private final Pool<RefCountedMemorySegment> memorySegmentPool;
     private final BlockCache<RefCountedMemorySegment> blockCache;
     private final Worker readAheadworker;
-    private final KeyResolver keyResolver;
     private final Provider provider;
     private final Path dirPath;
     private final byte[] dataKeyBytes;
@@ -101,7 +100,6 @@ public class CryptoDirectIODirectory extends FSDirectory {
     )
         throws IOException {
         super(path, lockFactory);
-        this.keyResolver = keyResolver;
         this.memorySegmentPool = memorySegmentPool;
         this.blockCache = blockCache;
         this.readAheadworker = worker;

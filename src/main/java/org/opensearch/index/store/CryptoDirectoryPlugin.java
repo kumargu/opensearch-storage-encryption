@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -46,31 +47,26 @@ import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
 /**
- * A plugin that enables index level encryption and decryption.
+ * Index-level encryption plugin that wraps the default DirectoryFactory
+ * when "index.store.crypto.enabled = true".
  */
 public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, EnginePlugin, TelemetryAwarePlugin {
+
     private PoolBuilder.PoolResources sharedPoolResources;
     private NodeEnvironment nodeEnvironment;
 
-    /**
-     * The default constructor.
-     */
-    public CryptoDirectoryPlugin() {
-        super();
-    }
-
-    /**
-     * {@inheritDoc}
-     */
     @Override
     public List<Setting<?>> getSettings() {
         return Arrays
             .asList(
+                // plugin settings
+                CryptoDirectoryFactory.INDEX_CRYPTO_ENABLED_SETTING,
                 CryptoDirectoryFactory.INDEX_KEY_PROVIDER_SETTING,
                 CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING,
                 CryptoDirectoryFactory.INDEX_KMS_ARN_SETTING,
                 CryptoDirectoryFactory.INDEX_KMS_ENC_CTX_SETTING,
                 CryptoDirectoryFactory.NODE_KEY_REFRESH_INTERVAL_SECS_SETTING,
+                // pool + cache size tuning
                 PoolSizeCalculator.NODE_POOL_SIZE_PERCENTAGE_SETTING,
                 PoolSizeCalculator.NODE_CACHE_TO_POOL_RATIO_SETTING,
                 PoolSizeCalculator.NODE_WARMUP_PERCENTAGE_SETTING
@@ -78,23 +74,20 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     }
 
     /**
-     * {@inheritDoc}
+     * Register directory factories for standard store types.
+     * The factory checks INDEX_CRYPTO_ENABLED flag to decide whether to encrypt.
      */
     @Override
     public Map<String, DirectoryFactory> getDirectoryFactories() {
-        return Collections.singletonMap("cryptofs", new CryptoDirectoryFactory());
-    }
+        CryptoDirectoryFactory factory = new CryptoDirectoryFactory();
+        Map<String, DirectoryFactory> factories = new HashMap<>();
 
-    /**
-     * {@inheritDoc}
-     */
-    @Override
-    public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
-        // Only provide our custom engine factory for cryptofs indices
-        if ("cryptofs".equals(indexSettings.getValue(IndexModule.INDEX_STORE_TYPE_SETTING))) {
-            return Optional.of(new CryptoEngineFactory());
+        // register factory for all known store types
+        for (IndexModule.Type t : IndexModule.Type.values()) {
+            factories.put(t.getSettingsKey(), factory);
         }
-        return Optional.empty();
+
+        return factories;
     }
 
     @Override
@@ -114,6 +107,8 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
         MetricsRegistry metricsRegistry
     ) {
         this.nodeEnvironment = nodeEnvironment;
+
+        // Initialize shared resources
         sharedPoolResources = CryptoDirectoryFactory.initializeSharedPool(environment.settings());
         NodeLevelKeyCache.initialize(environment.settings());
         CryptoMetricsService.initialize(metricsRegistry);
@@ -130,44 +125,51 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
 
     @Override
     public void onIndexModule(IndexModule indexModule) {
-        Settings indexSettings = indexModule.getSettings();
-        String storeType = indexSettings.get(IndexModule.INDEX_STORE_TYPE_SETTING.getKey());
+        Settings idxSettings = indexModule.getSettings();
+        boolean cryptoEnabled = CryptoDirectoryFactory.INDEX_CRYPTO_ENABLED_SETTING.get(idxSettings);
 
-        if ("cryptofs".equals(storeType)) {
-            indexModule.addIndexEventListener(new IndexEventListener() {
-                /*
-                 * Cache invalidation for closed shards is now handled automatically
-                 * by CryptoDirectIODirectory.close() when the directory is closed.
-                 */
-                @Override
-                public void afterIndexRemoved(Index index, IndexSettings idxSettings, IndexRemovalReason reason) {
-                    if (reason != IndexRemovalReason.DELETED) {
-                        return;
-                    }
+        if (cryptoEnabled == false) {
+            return; // normal store behavior
+        }
 
-                    BlockCache<?> cache = CryptoDirectoryFactory.getSharedBlockCache();
-                    if (cache != null && nodeEnvironment != null) {
-                        for (Path indexPath : nodeEnvironment.indexPaths(index)) {
-                            cache.invalidateByPathPrefix(indexPath);
-                        }
-                    }
+        // install deletion + resolver pruning logic for encrypted indices
+        indexModule.addIndexEventListener(new IndexEventListener() {
+            @Override
+            public void afterIndexRemoved(Index index, IndexSettings settings, IndexRemovalReason reason) {
+                if (reason != IndexRemovalReason.DELETED) {
+                    return;
+                }
 
-                    /*
-                    * The resolvers should be removed only when the index is actually deleted (DELETED reason).
-                    * We should NOT remove resolvers when shards are relocated (NO_LONGER_ASSIGNED) or during
-                    * node restarts, as other nodes may still need the resolver for their shards.
-                    * 
-                    * This prevents race conditions during:
-                    * - Shard relocation between nodes
-                    * - Node restarts with replica recovery
-                    * - Cluster topology changes
-                    * */
-                    int nShards = idxSettings.getNumberOfShards();
-                    for (int i = 0; i < nShards; i++) {
-                        ShardKeyResolverRegistry.removeResolver(index.getUUID(), i);
+                // invalidate cache entries for that index
+                BlockCache<?> cache = CryptoDirectoryFactory.getSharedBlockCache();
+                if (cache != null && nodeEnvironment != null) {
+                    for (Path indexPath : nodeEnvironment.indexPaths(index)) {
+                        cache.invalidateByPathPrefix(indexPath);
                     }
                 }
-            });
+
+                // remove shard-key resolvers
+                int nShards = settings.getNumberOfShards();
+                for (int i = 0; i < nShards; i++) {
+                    ShardKeyResolverRegistry.removeResolver(index.getUUID(), i);
+                }
+            }
+        });
+    }
+
+    /**
+     * EngineFactory (optional override).
+     * If you want a custom engine, plug it in here.
+     * For now, we only override the directory layer.
+     */
+    @Override
+    public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
+        boolean cryptoEnabled = CryptoDirectoryFactory.INDEX_CRYPTO_ENABLED_SETTING.get(indexSettings.getSettings());
+
+        if (cryptoEnabled) {
+            return Optional.of(new CryptoEngineFactory());
         }
+
+        return Optional.empty();
     }
 }

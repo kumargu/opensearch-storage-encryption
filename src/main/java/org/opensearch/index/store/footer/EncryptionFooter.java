@@ -7,12 +7,18 @@ package org.opensearch.index.store.footer;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.security.InvalidAlgorithmParameterException;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
+import javax.crypto.NoSuchPaddingException;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -292,7 +298,8 @@ public class EncryptionFooter {
 
             // Extract the 16-byte GCM tag from the end
             return Arrays.copyOfRange(result, result.length - 16, result.length);
-        } catch (Exception e) {
+        } catch (InvalidAlgorithmParameterException | InvalidKeyException | NoSuchAlgorithmException | BadPaddingException
+            | IllegalBlockSizeException | NoSuchPaddingException e) {
             throw new IOException("Failed to generate footer auth tag", e);
         }
     }

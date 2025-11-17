@@ -10,8 +10,6 @@ import java.security.Provider;
 
 import javax.crypto.spec.SecretKeySpec;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
@@ -35,7 +33,6 @@ import org.opensearch.index.store.metrics.ErrorType;
  * @opensearch.internal
  */
 public class DefaultKeyResolver implements KeyResolver {
-    private static final Logger LOGGER = LogManager.getLogger(DefaultKeyResolver.class);
 
     private final String indexUuid;
     private final Directory directory;
@@ -128,7 +125,7 @@ public class DefaultKeyResolver implements KeyResolver {
             byte[] indexKey = HkdfKeyDerivation.deriveIndexKey(masterKey, indexUuid);
             byte[] directoryKey = HkdfKeyDerivation.deriveDirectoryKey(indexKey, shardId);
             return new SecretKeySpec(directoryKey, "AES");
-        } catch (Exception e) {
+        } catch (IOException e) {
             CryptoMetricsService.getInstance().recordError(ErrorType.KMS_KEY_ERROR, this.indexUuid);
             throw e;
         }

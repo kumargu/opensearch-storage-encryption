@@ -4,8 +4,6 @@
  */
 package org.opensearch.index.store.cipher;
 
-import static org.junit.Assert.assertArrayEquals;
-
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
