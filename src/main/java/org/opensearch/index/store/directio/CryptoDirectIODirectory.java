@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.Provider;
 import java.time.Duration;
+import java.util.Collection;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.logging.log4j.LogManager;
@@ -201,6 +202,36 @@ public class CryptoDirectIODirectory extends FSDirectory {
         // when the shard/index is closed or deleted
         if (blockCache != null) {
             blockCache.invalidateByPathPrefix(dirPath);
+        }
+    }
+
+    @Override
+    public void sync(Collection<String> names) throws IOException {
+        LOGGER.info("Sync was called");
+        super.sync(names);  // fsync flushes dirty pages
+
+        for (String name : names) {
+            dropFileCache(name);  // NOW it is SAFE to drop the page cache: cache drop after sync
+        }
+    }
+
+    /**
+     * Drop OS page cache for a file to reclaim memory.
+     * Called after sync to ensure all dirty pages are flushed first.
+     */
+    private void dropFileCache(String name) {
+        try {
+            Path file = dirPath.resolve(name);
+            long fileSize = Files.size(file);
+
+            // Only drop cache for large files (> 32 MB)
+            if (fileSize > 32L * 1024 * 1024) {
+                String absolutePath = file.toAbsolutePath().toString();
+                org.opensearch.index.store.PanamaNativeAccess.dropFileCache(absolutePath);
+            }
+        } catch (IOException e) {
+            // Non-fatal: log and continue
+            LOGGER.debug("Failed to drop page cache for file: {}", name, e);
         }
     }
 

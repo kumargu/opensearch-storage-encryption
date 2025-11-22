@@ -358,14 +358,6 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
                 // Cache the final partial block if present (avoids disk I/O for immediate reads)
                 cacheFinalPartialBlock();
 
-                // signal the kernel to flush the file cacehe
-                // we don't call flush aggresevley to avoid cpu pressure.
-                if (streamOffset > 32L * 1024 * 1024) {
-                    String absolutePath = path.toAbsolutePath().toString();
-                    // Drop cache BEFORE deletion while file handle is still valid
-                    Thread.startVirtualThread(() -> PanamaNativeAccess.dropFileCache(absolutePath));
-                }
-
             } catch (IOException e) {
                 exception = e;
             } finally {
